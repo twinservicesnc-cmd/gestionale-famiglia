@@ -1,5 +1,5 @@
 import streamlit as st
-import json, os, io, zipfile, hashlib, secrets, uuid
+import json, os, io, hashlib, secrets, uuid
 from pathlib import Path
 from datetime import date, datetime
 
@@ -48,7 +48,7 @@ def nuovo_db():
         ("figlia17", "Figlia 17 anni", "figlio", "figlia17123"),
         ("figlia10", "Figlia 10 anni", "figlio", "figlia10123"),
     ]
-    db = {"versione": 1, "famiglia": "La nostra famiglia", "utenti": {}, "config": {"drive_folder_id": ""}}
+    db = {"versione": 2, "famiglia": "La nostra famiglia", "utenti": {}, "config": {"drive_folder_id": "", "budget_mensile": 0.0, "ultimo_backup_giornaliero": ""}}
     for username, nome, ruolo, pwd in utenti:
         db["utenti"][username] = {"nome": nome, "ruolo": ruolo, "password": password_hash(pwd), "attivo": True}
     for c in COLLEZIONI: db[c] = []
@@ -56,20 +56,38 @@ def nuovo_db():
 
 def carica():
     if not DATA.exists():
-        salva(nuovo_db())
+        salva(nuovo_db(), sincronizza=False)
     try:
         db = json.loads(DATA.read_text(encoding="utf-8"))
     except Exception:
-        db = nuovo_db(); salva(db)
+        db = nuovo_db(); salva(db, sincronizza=False)
+    try:
+        remoto = drive_carica_db(db)
+        if remoto:
+            db = remoto
+            salva(db, sincronizza=False)
+            st.session_state["drive_sync_status"] = "Dati aggiornati da Google Drive"
+    except Exception as exc:
+        st.session_state["drive_sync_error"] = str(exc)
     for c in COLLEZIONI: db.setdefault(c, [])
     db.setdefault("utenti", {})
-    db.setdefault("config", {"drive_folder_id": ""})
+    db.setdefault("config", {})
+    db["config"].setdefault("drive_folder_id", "")
+    db["config"].setdefault("budget_mensile", 0.0)
+    db["config"].setdefault("ultimo_backup_giornaliero", "")
     return db
 
-def salva(db):
+def salva(db, sincronizza=True):
     tmp = DATA.with_suffix(".tmp")
     tmp.write_text(json.dumps(db, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp, DATA)
+    if sincronizza:
+        try:
+            drive_salva_db(db)
+            st.session_state["drive_sync_status"] = f"Salvato su Google Drive alle {datetime.now().strftime('%H:%M:%S')}"
+            st.session_state.pop("drive_sync_error", None)
+        except Exception as exc:
+            st.session_state["drive_sync_error"] = str(exc)
 
 def oggi(): return date.today().isoformat()
 def nuovo_id(): return uuid.uuid4().hex
@@ -173,6 +191,51 @@ def drive_cartella(service, nome, parent):
     if parent: body["parents"] = [parent]
     return service.files().create(body=body, fields="id").execute()["id"]
 
+def drive_file(service, nome, parent):
+    nome_pulito = nome.replace("'", "")
+    q = f"name='{nome_pulito}' and trashed=false and '{parent}' in parents"
+    files = service.files().list(q=q, fields="files(id,name,webViewLink,modifiedTime)", pageSize=1).execute().get("files", [])
+    return files[0] if files else None
+
+def drive_scrivi_bytes(db, contenuto, nome, percorso, mimetype="application/json", sovrascrivi=True):
+    from googleapiclient.http import MediaIoBaseUpload
+    srv, parent = drive_service(), drive_root(db)
+    if not parent: raise RuntimeError("Manca [gcp_famiglia] folder_id nei Secrets.")
+    for cartella in percorso: parent = drive_cartella(srv, cartella, parent)
+    media = MediaIoBaseUpload(io.BytesIO(contenuto), mimetype=mimetype, resumable=False)
+    esistente = drive_file(srv, nome, parent) if sovrascrivi else None
+    if esistente:
+        return srv.files().update(fileId=esistente["id"], media_body=media, fields="id,webViewLink,name,modifiedTime").execute()
+    return srv.files().create(body={"name": nome, "parents": [parent]}, media_body=media, fields="id,webViewLink,name,modifiedTime").execute()
+
+def drive_salva_db(db):
+    payload = json.dumps(db, ensure_ascii=False, indent=2).encode("utf-8")
+    return drive_scrivi_bytes(db, payload, "gestionale_famiglia_live.json", ["DATI"], sovrascrivi=True)
+
+def drive_carica_db(db_locale):
+    from googleapiclient.http import MediaIoBaseDownload
+    srv, parent = drive_service(), drive_root(db_locale)
+    if not parent: return None
+    dati = drive_cartella(srv, "DATI", parent)
+    trovato = drive_file(srv, "gestionale_famiglia_live.json", dati)
+    if not trovato: return None
+    buffer = io.BytesIO()
+    downloader = MediaIoBaseDownload(buffer, srv.files().get_media(fileId=trovato["id"]))
+    fine = False
+    while not fine:
+        _, fine = downloader.next_chunk()
+    remoto = json.loads(buffer.getvalue().decode("utf-8"))
+    return remoto if isinstance(remoto, dict) and isinstance(remoto.get("utenti"), dict) else None
+
+def backup_giornaliero(db):
+    giorno = oggi()
+    if db["config"].get("ultimo_backup_giornaliero") == giorno: return
+    payload = json.dumps(db, ensure_ascii=False, indent=2).encode("utf-8")
+    nome = f"gestionale_famiglia_{giorno.replace('-', '')}.json"
+    drive_scrivi_bytes(db, payload, nome, ["BACKUP", "AUTOMATICI"], sovrascrivi=True)
+    db["config"]["ultimo_backup_giornaliero"] = giorno
+    salva(db)
+
 def drive_upload(db, file, percorso):
     from googleapiclient.http import MediaIoBaseUpload
     srv, parent = drive_service(), drive_root(db)
@@ -208,6 +271,9 @@ def dashboard(db):
     st.subheader("Prossimi impegni")
     prossimi = sorted([x for x in visibili(db["calendario"]) if x.get("data","") >= oggi()], key=lambda x:x.get("data",""))[:10]
     st.dataframe(prossimi, use_container_width=True, hide_index=True)
+    st.subheader("Prossime scadenze")
+    prossime_scadenze = sorted([x for x in visibili(db["scadenze"]) if not x.get("completata") and x.get("data", "") >= oggi()], key=lambda x:x.get("data", ""))[:10]
+    st.dataframe(prossime_scadenze, use_container_width=True, hide_index=True)
 
 def calendario(db):
     st.title("📅 Calendario e impegni")
@@ -226,7 +292,11 @@ def finanze(db):
         if st.form_submit_button("Registra movimento") and importo>0:
             registra(db,"movimenti",{"tipo":tipo,"data":str(data),"importo":importo,"categoria":categoria,"descrizione":descrizione},condiviso); st.rerun()
     righe=visibili(db["movimenti"]); entrate=sum(float(x.get("importo",0)) for x in righe if x.get("tipo")=="Entrata"); spese=sum(float(x.get("importo",0)) for x in righe if x.get("tipo")=="Spesa")
-    a,b,c=st.columns(3); a.metric("Entrate",f"€ {entrate:,.2f}"); b.metric("Spese",f"€ {spese:,.2f}"); c.metric("Saldo",f"€ {entrate-spese:,.2f}")
+    mese=oggi()[:7]; spese_mese=sum(float(x.get("importo",0)) for x in righe if x.get("tipo")=="Spesa" and str(x.get("data","")).startswith(mese)); budget=float(db["config"].get("budget_mensile",0) or 0)
+    a,b,c,d=st.columns(4); a.metric("Entrate",f"€ {entrate:,.2f}"); b.metric("Spese",f"€ {spese:,.2f}"); c.metric("Saldo",f"€ {entrate-spese:,.2f}"); d.metric("Budget residuo mese",f"€ {budget-spese_mese:,.2f}" if budget else "Non impostato")
+    if budget:
+        st.progress(min(spese_mese/budget,1.0),text=f"Spese del mese: € {spese_mese:,.2f} su € {budget:,.2f}")
+        if spese_mese>budget: st.warning(f"Budget mensile superato di € {spese_mese-budget:,.2f}.")
     tabella_con_elimina(db,"movimenti",righe,["data","tipo","categoria","descrizione","importo"])
 
 def spesa(db):
@@ -245,7 +315,10 @@ def scadenze(db):
     with st.form("f_scad"):
         c1,c2=st.columns(2); titolo=c1.text_input("Scadenza"); data=c2.date_input("Data"); note=st.text_area("Note"); condiviso=st.checkbox("Condivisa",True)
         if st.form_submit_button("Salva") and titolo: registra(db,"scadenze",{"titolo":titolo,"data":str(data),"note":note,"completata":False},condiviso); st.rerun()
-    tabella_con_elimina(db,"scadenze",visibili(db["scadenze"]),["data","titolo","note","completata"])
+    for x in visibili(db["scadenze"]):
+        c1,c2=st.columns([8,1]); nuovo=c1.checkbox(f"{x.get('data')} · {x.get('titolo')} · {x.get('note','')}",value=x.get("completata",False),key="scad_"+x["id"])
+        if nuovo != x.get("completata",False): x["completata"]=nuovo; salva(db); st.rerun()
+        if c2.button("🗑️",key="scad_del_"+x["id"]): elimina(db,"scadenze",x["id"]); st.rerun()
 
 def archivio(db, tipo):
     media = tipo=="media"; st.title("📷 Foto e filmati" if media else "📁 Documenti importanti")
@@ -256,11 +329,17 @@ def archivio(db, tipo):
         ok=0
         for f in files:
             try:
-                out=drive_upload(db,f,[str(anno),evento,"Foto e Video" if media else "Documenti"])
+                out=drive_upload(db,f,["ARCHIVIO",str(anno),evento,"Foto e Video" if media else "Documenti"])
                 registra(db,tipo,{"anno":anno,"evento":evento,"descrizione":descrizione,"nome_file":out["name"],"drive_id":out["id"],"link":out.get("webViewLink","")},condiviso); ok+=1
             except Exception as e: st.error(str(e)); break
         if ok: st.success(f"Caricati {ok} file su Google Drive.")
-    righe=visibili(db[tipo]); tabella_con_elimina(db,tipo,righe,["anno","evento","descrizione","nome_file","link"])
+    righe=visibili(db[tipo])
+    if not righe: st.info("Nessun file archiviato."); return
+    anni=["Tutti"]+[str(x) for x in sorted({r.get("anno") for r in righe},reverse=True)]
+    eventi=["Tutti"]+sorted({str(r.get("evento","")) for r in righe if r.get("evento")})
+    filtro_anno=st.selectbox("Filtra per anno",anni,key="anno_"+tipo); filtro_evento=st.selectbox("Filtra per evento",eventi,key="evento_"+tipo)
+    filtrate=[r for r in righe if (filtro_anno=="Tutti" or str(r.get("anno"))==filtro_anno) and (filtro_evento=="Tutti" or r.get("evento")==filtro_evento)]
+    tabella_con_elimina(db,tipo,filtrate,["anno","evento","descrizione","nome_file","link"])
 
 def semplice(db, raccolta, titolo, campi, condiviso_default):
     st.title(titolo)
@@ -271,7 +350,13 @@ def semplice(db, raccolta, titolo, campi, condiviso_default):
         condiviso=st.checkbox("Condiviso",condiviso_default)
         if st.form_submit_button("Salva") and str(vals[campi[0][0]]).strip():
             vals={k:str(v) for k,v in vals.items()}; registra(db,raccolta,vals,condiviso); st.rerun()
-    tabella_con_elimina(db,raccolta,visibili(db[raccolta]),[x[0] for x in campi])
+    if raccolta=="faccende":
+        for x in visibili(db[raccolta]):
+            c1,c2=st.columns([8,1]); nuovo=c1.checkbox(f"{x.get('data')} · {x.get('titolo')} · {x.get('persona')} · {x.get('note','')}",value=x.get("completata",False),key="fac_"+x["id"])
+            if nuovo != x.get("completata",False): x["completata"]=nuovo; salva(db); st.rerun()
+            if c2.button("🗑️",key="fac_del_"+x["id"]): elimina(db,raccolta,x["id"]); st.rerun()
+    else:
+        tabella_con_elimina(db,raccolta,visibili(db[raccolta]),[x[0] for x in campi])
 
 def amministrazione(db):
     st.title("⚙️ Amministrazione")
@@ -287,6 +372,11 @@ def amministrazione(db):
             salva(db); st.success("Utente aggiornato.")
     folder=st.text_input("ID cartella principale Google Drive",db["config"].get("drive_folder_id",""))
     if st.button("Salva configurazione Drive"): db["config"]["drive_folder_id"]=folder.strip(); salva(db); st.success("Configurazione salvata.")
+    budget=st.number_input("Budget familiare mensile €",min_value=0.0,value=float(db["config"].get("budget_mensile",0) or 0),step=50.0)
+    if st.button("Salva budget mensile"): db["config"]["budget_mensile"]=budget; salva(db); st.success("Budget mensile salvato.")
+    st.subheader("Stato Google Drive")
+    if st.session_state.get("drive_sync_error"): st.error(st.session_state["drive_sync_error"])
+    else: st.success(st.session_state.get("drive_sync_status","Google Drive configurato"))
 
 def backup(db):
     st.title("💾 Backup")
@@ -304,9 +394,18 @@ db=carica()
 if not st.session_state.get("autenticato"):
     login(db); st.stop()
 
+try:
+    backup_giornaliero(db)
+    st.session_state.pop("backup_giornaliero_error",None)
+except Exception as exc:
+    st.session_state["backup_giornaliero_error"]=str(exc)
+
 info=db["utenti"][utente()]
 with st.sidebar:
     st.title("🏠 Gestionale Famiglia"); st.write(f"👤 **{info['nome']}**"); st.caption(info["ruolo"].title())
+    if st.session_state.get("drive_sync_error"): st.error("Sincronizzazione Drive non riuscita")
+    else: st.success("Google Drive sincronizzato")
+    if st.session_state.get("backup_giornaliero_error"): st.warning("Backup giornaliero da verificare")
     opzioni=list(SEZIONI)
     if not admin(): opzioni.remove("⚙️ Amministrazione")
     scelta=st.radio("Menu",opzioni)
