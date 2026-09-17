@@ -105,7 +105,19 @@ def drive_service():
         from googleapiclient.discovery import build
         raw = st.secrets.get("gcp_service_account", {})
         raw = raw.get("content", raw) if hasattr(raw, "get") else raw
-        info = json.loads(raw) if isinstance(raw, str) else dict(raw)
+        if isinstance(raw, str):
+            raw = raw.lstrip("\ufeff").strip()
+            try:
+                info = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                # Alcuni editor/TOML trasformano i \\n della chiave PEM in
+                # veri a-capo dentro la stringa JSON. strict=False consente di
+                # acquisirli; subito sotto la chiave viene normalizzata.
+                if "Invalid control character" not in str(exc):
+                    raise
+                info = json.loads(raw, strict=False)
+        else:
+            info = dict(raw)
         # Streamlit/TOML puo conservare gli a-capo della chiave come sequenze
         # letterali. Normalizziamo entrambi i formati prima di creare le credenziali.
         private_key = str(info.get("private_key", ""))
