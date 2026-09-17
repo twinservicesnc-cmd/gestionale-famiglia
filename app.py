@@ -100,6 +100,35 @@ def tabella_con_elimina(db, raccolta, righe, colonne):
             elimina(db, raccolta, opzioni[scelta]["id"]); st.rerun()
 
 def drive_service():
+    oauth_error = None
+    oauth_configured = False
+    try:
+        oauth_section = st.secrets.get("gcp_drive_oauth")
+        if oauth_section:
+            oauth_configured = True
+            oauth = dict(oauth_section)
+            content = oauth.get("content", "")
+            if content:
+                parsed = json.loads(content, strict=False) if isinstance(content, str) else dict(content)
+                oauth = {**parsed, **{k:v for k,v in oauth.items() if k != "content"}}
+            client_id = str(oauth.get("client_id", "") or "").strip()
+            client_secret = str(oauth.get("client_secret", "") or "").strip()
+            refresh_token = str(oauth.get("refresh_token", "") or "").strip()
+            token_uri = str(oauth.get("token_uri", "https://oauth2.googleapis.com/token") or "https://oauth2.googleapis.com/token").strip()
+            if client_id and client_secret and refresh_token:
+                from google.oauth2.credentials import Credentials
+                from google.auth.transport.requests import Request
+                from googleapiclient.discovery import build
+                cred = Credentials(token=None, refresh_token=refresh_token, token_uri=token_uri,
+                                   client_id=client_id, client_secret=client_secret)
+                cred.refresh(Request())
+                st.session_state["drive_auth_mode"] = "OAuth personale"
+                return build("drive", "v3", credentials=cred, cache_discovery=False)
+            oauth_error = "mancano client_id, client_secret o refresh_token"
+    except Exception as exc:
+        oauth_error = f"{type(exc).__name__}: {exc}"
+    if oauth_configured:
+        raise RuntimeError(f"OAuth Google Drive non valido: {oauth_error or 'configurazione incompleta'}")
     try:
         from google.oauth2.service_account import Credentials
         from googleapiclient.discovery import build
@@ -125,9 +154,11 @@ def drive_service():
         if private_key:
             info["private_key"] = private_key + "\n"
         cred = Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/drive"])
+        st.session_state["drive_auth_mode"] = "Service account"
         return build("drive", "v3", credentials=cred, cache_discovery=False)
     except Exception as e:
-        raise RuntimeError(f"Google Drive non configurato: {e}")
+        dettaglio = f" OAuth: {oauth_error}." if oauth_error else ""
+        raise RuntimeError(f"Google Drive non configurato:{dettaglio} Service account: {e}")
 
 def drive_root(db):
     try: return str(st.secrets.get("gcp_famiglia", {}).get("folder_id", "")).strip() or db["config"].get("drive_folder_id", "")
