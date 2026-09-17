@@ -1,5 +1,5 @@
 import streamlit as st
-import json, os, io, hashlib, secrets, uuid
+import json, os, io, hashlib, secrets, uuid, tempfile, mimetypes
 from pathlib import Path
 from datetime import date, datetime
 
@@ -246,6 +246,103 @@ def drive_upload(db, file, percorso):
     out = srv.files().create(body=meta, media_body=media, fields="id,webViewLink,name").execute()
     return out
 
+def drive_upload_path(db, percorso_file, nome_file, mimetype, percorso):
+    from googleapiclient.http import MediaFileUpload
+    srv, parent = drive_service(), drive_root(db)
+    if not parent: raise RuntimeError("Manca [gcp_famiglia] folder_id nei Secrets.")
+    for nome in percorso: parent = drive_cartella(srv, nome, parent)
+    media = MediaFileUpload(percorso_file, mimetype=mimetype or "application/octet-stream", resumable=True)
+    meta = {"name": nome_file, "parents": [parent]}
+    return srv.files().create(body=meta, media_body=media, fields="id,webViewLink,name").execute()
+
+def photos_credentials():
+    try:
+        raw = dict(st.secrets["gcp_photos_oauth"])
+        client_id = str(raw.get("client_id", "")).strip()
+        client_secret = str(raw.get("client_secret", "")).strip()
+        refresh_token = str(raw.get("refresh_token", "")).strip()
+        token_uri = str(raw.get("token_uri", "https://oauth2.googleapis.com/token")).strip()
+        if not client_id or not client_secret or not refresh_token:
+            raise RuntimeError("mancano client_id, client_secret o refresh_token")
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request
+        cred = Credentials(token=None, refresh_token=refresh_token, token_uri=token_uri,
+                           client_id=client_id, client_secret=client_secret,
+                           scopes=["https://www.googleapis.com/auth/photospicker.mediaitems.readonly"])
+        cred.refresh(Request())
+        return cred
+    except Exception as exc:
+        raise RuntimeError(f"Google Foto non configurato: {exc}")
+
+def photos_api(method, endpoint, cred, **kwargs):
+    import requests
+    headers = dict(kwargs.pop("headers", {}))
+    headers["Authorization"] = f"Bearer {cred.token}"
+    response = requests.request(method, f"https://photospicker.googleapis.com/v1/{endpoint}", headers=headers, timeout=60, **kwargs)
+    if not response.ok:
+        try: dettaglio = response.json().get("error", {}).get("message", response.text)
+        except Exception: dettaglio = response.text
+        raise RuntimeError(f"Google Foto: {response.status_code} {dettaglio}")
+    return response.json() if response.content else {}
+
+def photos_crea_sessione():
+    cred = photos_credentials()
+    sessione = photos_api("POST", "sessions", cred, json={})
+    if not sessione.get("id") or not sessione.get("pickerUri"):
+        raise RuntimeError("Google Foto non ha restituito una sessione valida.")
+    return sessione
+
+def photos_lista_selezionati(session_id, cred):
+    elementi, token = [], None
+    while True:
+        params = {"sessionId": session_id, "pageSize": 100}
+        if token: params["pageToken"] = token
+        risposta = photos_api("GET", "mediaItems", cred, params=params)
+        elementi.extend(risposta.get("mediaItems", []))
+        token = risposta.get("nextPageToken")
+        if not token: return elementi
+
+def photos_importa_selezione(db, session_id, anno, evento, descrizione, condiviso):
+    import requests
+    cred = photos_credentials()
+    sessione = photos_api("GET", f"sessions/{session_id}", cred)
+    if not sessione.get("mediaItemsSet"):
+        return 0, 0, False
+    elementi = photos_lista_selezionati(session_id, cred)
+    gia_presenti = {str(x.get("photos_picker_id")) for x in db["media"] if x.get("photos_picker_id")}
+    importati = saltati = 0
+    for item in elementi:
+        picker_id = str(item.get("id", ""))
+        if picker_id and picker_id in gia_presenti:
+            saltati += 1; continue
+        media_file = item.get("mediaFile", {})
+        base_url = str(media_file.get("baseUrl", ""))
+        mime = str(media_file.get("mimeType", "application/octet-stream"))
+        nome = Path(str(media_file.get("filename") or f"google_foto_{picker_id}{mimetypes.guess_extension(mime) or ''}")).name
+        if not base_url: continue
+        url = base_url + ("=dv" if mime.startswith("video/") else "=d")
+        temp_path = None
+        try:
+            with requests.get(url, headers={"Authorization": f"Bearer {cred.token}"}, stream=True, timeout=180) as risposta:
+                risposta.raise_for_status()
+                with tempfile.NamedTemporaryFile(delete=False, suffix=Path(nome).suffix) as temp:
+                    temp_path = temp.name
+                    totale = 0
+                    for blocco in risposta.iter_content(chunk_size=1024*1024):
+                        if not blocco: continue
+                        totale += len(blocco)
+                        if totale > 1024*1024*1024:
+                            raise RuntimeError(f"{nome}: file superiore a 1 GB")
+                        temp.write(blocco)
+            out = drive_upload_path(db, temp_path, nome, mime, ["ARCHIVIO",str(anno),evento,"Foto e Video"])
+            dati = {"anno":anno,"evento":evento,"descrizione":descrizione,"nome_file":out["name"],"drive_id":out["id"],"link":out.get("webViewLink",""),"photos_picker_id":picker_id,"origine":"Google Foto"}
+            registra(db,"media",dati,condiviso); importati += 1
+        finally:
+            if temp_path and os.path.exists(temp_path): os.unlink(temp_path)
+    try: photos_api("DELETE", f"sessions/{session_id}", cred)
+    except Exception: pass
+    return importati, saltati, True
+
 def login(db):
     st.title("🏠 Gestionale Famiglia")
     st.caption("Accesso riservato ai componenti della famiglia")
@@ -323,6 +420,8 @@ def scadenze(db):
 def archivio(db, tipo):
     media = tipo=="media"; st.title("📷 Foto e filmati" if media else "📁 Documenti importanti")
     anno=st.selectbox("Anno",list(range(date.today().year+1,1999,-1))); evento=st.text_input("Evento / categoria"); descrizione=st.text_input("Descrizione")
+    if media:
+        st.subheader("📱 Carica dal telefono, tablet o computer")
     files=st.file_uploader("Seleziona file",accept_multiple_files=True,type=None if media else ["pdf","doc","docx","jpg","jpeg","png","xlsx"])
     condiviso=st.checkbox("Visibile alla famiglia",True)
     if st.button("Carica su Google Drive",type="primary",disabled=not files or not evento):
@@ -333,6 +432,29 @@ def archivio(db, tipo):
                 registra(db,tipo,{"anno":anno,"evento":evento,"descrizione":descrizione,"nome_file":out["name"],"drive_id":out["id"],"link":out.get("webViewLink","")},condiviso); ok+=1
             except Exception as e: st.error(str(e)); break
         if ok: st.success(f"Caricati {ok} file su Google Drive.")
+    if media:
+        st.divider(); st.subheader("🖼️ Importa da Google Foto")
+        st.caption("Seleziona anche molte foto e filmati insieme; il gestionale li copierà automaticamente nell'evento indicato sopra.")
+        if st.button("1. Avvia selezione Google Foto", disabled=not evento, use_container_width=True):
+            try:
+                sessione=photos_crea_sessione()
+                st.session_state["photos_session_id"]=sessione["id"]
+                st.session_state["photos_picker_uri"]=sessione["pickerUri"]
+            except Exception as exc: st.error(str(exc))
+        picker_uri=st.session_state.get("photos_picker_uri")
+        session_id=st.session_state.get("photos_session_id")
+        if picker_uri and session_id:
+            uri=picker_uri.rstrip("/")+"/autoclose"
+            st.link_button("2. Apri Google Foto e scegli i file",uri,use_container_width=True)
+            if st.button("3. Completa importazione",type="primary",use_container_width=True):
+                try:
+                    with st.spinner("Importazione da Google Foto e caricamento su Drive..."):
+                        importati,saltati,completata=photos_importa_selezione(db,session_id,anno,evento,descrizione,condiviso)
+                    if not completata: st.info("La selezione non è ancora terminata in Google Foto. Completala e riprova.")
+                    else:
+                        st.session_state.pop("photos_session_id",None); st.session_state.pop("photos_picker_uri",None)
+                        st.success(f"Importazione completata: {importati} file copiati su Drive"+(f", {saltati} già presenti." if saltati else "."))
+                except Exception as exc: st.error(str(exc))
     righe=visibili(db[tipo])
     if not righe: st.info("Nessun file archiviato."); return
     anni=["Tutti"]+[str(x) for x in sorted({r.get("anno") for r in righe},reverse=True)]
