@@ -106,6 +106,12 @@ def drive_service():
         raw = st.secrets.get("gcp_service_account", {})
         raw = raw.get("content", raw) if hasattr(raw, "get") else raw
         info = json.loads(raw) if isinstance(raw, str) else dict(raw)
+        # Streamlit/TOML puo conservare gli a-capo della chiave come sequenze
+        # letterali. Normalizziamo entrambi i formati prima di creare le credenziali.
+        private_key = str(info.get("private_key", ""))
+        private_key = private_key.replace("\\\\n", "\n").replace("\\n", "\n").replace("\r\n", "\n").strip()
+        if private_key:
+            info["private_key"] = private_key + "\n"
         cred = Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/drive"])
         return build("drive", "v3", credentials=cred, cache_discovery=False)
     except Exception as e:
