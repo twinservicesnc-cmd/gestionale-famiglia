@@ -127,31 +127,125 @@ def upload_verified(service, local_path: str, metadata: dict[str, Any], parent: 
     return remote
 
 def main() -> int:
-    token, service, root = dropbox_token(), drive_service(), required("GDRIVE_FOLDER_ID")
-    person = os.environ.get("DROPBOX_PERSONA", "Papà").strip() or "Papà"
-    source = os.environ.get("DROPBOX_SOURCE_PATH", "/Caricamenti da fotocamera").strip()
-    limit = max(1, min(int(os.environ.get("SYNC_MAX_FILES", "50")), 500))
-    database, files = read_family_database(service, root), list_dropbox_files(token, source)
-    print(f"Trovati {len(files)} file multimediali in Dropbox; massimo per esecuzione: {limit}")
-    copied = skipped = failed = 0
-    for item in files:
-        if copied >= limit:
-            break
-        try:
-            if find_by_dropbox_hash(service, item.get("content_hash", "")):
-                print(f"GIÀ PRESENTE: {item['name']}"); skipped += 1; continue
-            with tempfile.NamedTemporaryFile(delete=False, suffix=Path(item["name"]).suffix) as temp: temp_path = temp.name
-            try:
-                download_dropbox(token, item["path_lower"], temp_path)
-                taken = capture_datetime(temp_path, item); iso_date = taken.date().isoformat(); event = event_for_date(database, iso_date, person)
-                destination = drive_path(service, root, ["ARCHIVIO", person, str(taken.year), f"{iso_date} - {event}", "Foto e Video"])
-                uploaded = upload_verified(service, temp_path, item, destination, person)
-                print(f"COPIATO E VERIFICATO: {item['name']} -> {iso_date} - {event} ({uploaded['id']})"); copied += 1
-            finally:
-                if os.path.exists(temp_path): os.unlink(temp_path)
-        except Exception as exc:
-            failed += 1; print(f"ERRORE {item.get('name', '')}: {type(exc).__name__}: {exc}", file=sys.stderr)
-    print(f"Risultato: copiati={copied}, già_presenti={skipped}, errori={failed}")
-    return 1 if failed else 0
+    token = dropbox_token()
+    service = drive_service()
+    root = required("GDRIVE_FOLDER_ID")
 
+    person = os.environ.get("DROPBOX_PERSONA", "Papà").strip() or "Papà"
+    source = os.environ.get(
+        "DROPBOX_SOURCE_PATH",
+        "/Caricamenti da fotocamera",
+    ).strip()
+    limit = max(1, min(int(os.environ.get("SYNC_MAX_FILES", "50")), 500))
+
+    database = read_family_database(service, root)
+    files = list_dropbox_files(token, source)
+
+    print(
+        f"Trovati {len(files)} file multimediali in Dropbox; "
+        f"massimo per esecuzione: {limit}"
+    )
+
+    copied = 0
+    skipped = 0
+    deleted = 0
+    failed = 0
+    processed = 0
+
+    for item in files:
+        if processed >= limit:
+            break
+
+        processed += 1
+
+        try:
+            content_hash = item.get("content_hash", "")
+            existing = find_by_dropbox_hash(service, content_hash)
+
+            if existing:
+                dropbox_size = int(item.get("size", -1))
+                drive_size = int(existing.get("size", -2))
+
+                if dropbox_size < 0 or drive_size != dropbox_size:
+                    raise RuntimeError(
+                        f"Dimensione non coincidente per {item['name']}: "
+                        f"Dropbox={dropbox_size}, Drive={drive_size}"
+                    )
+
+                delete_dropbox(token, item["path_lower"])
+                print(
+                    f"GIÀ VERIFICATO SU DRIVE E RIMOSSO DA DROPBOX: "
+                    f"{item['name']}"
+                )
+                skipped += 1
+                deleted += 1
+                continue
+
+            with tempfile.NamedTemporaryFile(
+                delete=False,
+                suffix=Path(item["name"]).suffix,
+            ) as temp:
+                temp_path = temp.name
+
+            try:
+                download_dropbox(
+                    token,
+                    item["path_lower"],
+                    temp_path,
+                )
+
+                taken = capture_datetime(temp_path, item)
+                iso_date = taken.date().isoformat()
+                event = event_for_date(database, iso_date, person)
+
+                destination = drive_path(
+                    service,
+                    root,
+                    [
+                        "ARCHIVIO",
+                        person,
+                        str(taken.year),
+                        f"{iso_date} - {event}",
+                        "Foto e Video",
+                    ],
+                )
+
+                uploaded = upload_verified(
+                    service,
+                    temp_path,
+                    item,
+                    destination,
+                    person,
+                )
+
+                delete_dropbox(token, item["path_lower"])
+
+                print(
+                    f"COPIATO, VERIFICATO E RIMOSSO DA DROPBOX: "
+                    f"{item['name']} -> {iso_date} - {event} "
+                    f"({uploaded['id']})"
+                )
+
+                copied += 1
+                deleted += 1
+
+            finally:
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+
+        except Exception as exc:
+            failed += 1
+            print(
+                f"ERRORE {item.get('name', '')}: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+
+    print(
+        f"Risultato: elaborati={processed}, copiati={copied}, "
+        f"già_presenti={skipped}, rimossi_da_dropbox={deleted}, "
+        f"errori={failed}"
+    )
+
+    return 1 if failed else 0
 if __name__ == "__main__": raise SystemExit(main())
