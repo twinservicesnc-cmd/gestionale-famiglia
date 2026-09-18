@@ -4727,17 +4727,19 @@ def genera_pdf_prima_nota(movimenti, stagione):
 gruppi_grezzi = carica_json(FILE_GRUPPI, GRUPPI_STANDARD_DEFAULT)
 # Aggiornamento mirato per installazioni gia esistenti: rende disponibili i
 # nuovi gruppi Gold senza ripristinare eventuali altri gruppi eliminati.
+nuovi_gruppi_gold_aggiunti = False
 for nuovo_gruppo_giovanile in ("GOLD ABBADIA", "GOLD OSACO"):
     if _gruppo_key_compact(nuovo_gruppo_giovanile) not in {
         _gruppo_key_compact(g) for g in gruppi_grezzi
     }:
         gruppi_grezzi.append(nuovo_gruppo_giovanile)
+        nuovi_gruppi_gold_aggiunti = True
 visti = set(); gruppi_puliti = []
 for g in gruppi_grezzi:
     norm = normalizza_nome_gruppo(g)
     if norm and norm.lower() not in visti:
         visti.add(norm.lower()); gruppi_puliti.append(norm)
-if gruppi_puliti != gruppi_grezzi:
+if nuovi_gruppi_gold_aggiunti or gruppi_puliti != gruppi_grezzi:
     salva_json_sicuro(FILE_GRUPPI, gruppi_puliti)
 utenti_base = carica_json(FILE_UTENTI, {})
 if "admin" not in utenti_base:
