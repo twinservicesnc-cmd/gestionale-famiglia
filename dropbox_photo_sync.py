@@ -57,6 +57,8 @@ def download_dropbox(token: str, path: str, destination: str) -> None:
         with open(destination, "wb") as output:
             for chunk in response.iter_content(1024 * 1024):
                 if chunk: output.write(chunk)
+def delete_dropbox(token: str, path: str) -> None:
+    dbx_post("files/delete_v2", token, {"path": path})
 
 def drive_service():
     credentials = Credentials(token=None, refresh_token=required("GDRIVE_REFRESH_TOKEN"), token_uri="https://oauth2.googleapis.com/token", client_id=required("GDRIVE_CLIENT_ID"), client_secret=required("GDRIVE_CLIENT_SECRET"))
