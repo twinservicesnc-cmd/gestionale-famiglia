@@ -132,7 +132,9 @@ def main() -> int:
     database, files = read_family_database(service, root), list_dropbox_files(token, source)
     print(f"Trovati {len(files)} file multimediali in Dropbox; massimo per esecuzione: {limit}")
     copied = skipped = failed = 0
-    for item in files[:limit]:
+    for item in files:
+    if copied >= limit:
+        break
         try:
             if find_by_dropbox_hash(service, item.get("content_hash", "")):
                 print(f"GIÀ PRESENTE: {item['name']}"); skipped += 1; continue
