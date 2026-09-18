@@ -26,7 +26,7 @@ jobs:
       GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
       GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
       GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-      SYNC_MAX_FILES: "1"
+      SYNC_MAX_FILES: "50"
 
     steps:
       - name: Scarica il progetto
