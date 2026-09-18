@@ -21,7 +21,7 @@ jobs:
       DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
       DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
       DROPBOX_PERSONA: Papà
-      DROPBOX_SOURCE_PATH: /Caricamenti da fotocamera
+      DROPBOX_SOURCE_PATH: /Caricamenti dalla fotocamera
       GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
       GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
       GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
