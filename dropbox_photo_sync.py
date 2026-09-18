@@ -29,7 +29,12 @@ def dropbox_token() -> str:
         "grant_type": "refresh_token", "refresh_token": required("DROPBOX_REFRESH_TOKEN"),
         "client_id": required("DROPBOX_APP_KEY"), "client_secret": required("DROPBOX_APP_SECRET"),
     }, timeout=45)
-    response.raise_for_status()
+    if not response.ok:
+        try:
+            detail = response.json()
+        except Exception:
+            detail = response.text[:500]
+        raise RuntimeError(f"Dropbox OAuth {response.status_code}: {detail}")
     return response.json()["access_token"]
 
 def dbx_post(endpoint: str, token: str, payload: dict[str, Any]) -> dict[str, Any]:
