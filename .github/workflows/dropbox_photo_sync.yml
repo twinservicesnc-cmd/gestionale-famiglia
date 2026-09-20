@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 jobs:
-  copia-foto:
+  copia-foto-papa:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -41,5 +41,36 @@ jobs:
       - name: Installa dipendenze
         run: pip install -r requirements.txt
 
-      - name: Copia e verifica foto su Google Drive
+      - name: Archivia foto di Papà
+        run: python dropbox_photo_sync.py
+
+  copia-foto-mamma:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY_MAMMA }}
+      DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET_MAMMA }}
+      DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN_MAMMA }}
+      DROPBOX_PERSONA: Mamma
+      DROPBOX_SOURCE_PATH: /Caricamenti dalla fotocamera
+      GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+      GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+      GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+      GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+      SYNC_MAX_FILES: "1"
+
+    steps:
+      - name: Scarica il progetto
+        uses: actions/checkout@v4
+
+      - name: Configura Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Installa dipendenze
+        run: pip install -r requirements.txt
+
+      - name: Test archivio foto di Mamma
         run: python dropbox_photo_sync.py
