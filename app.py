@@ -299,6 +299,25 @@ def sincronizza_archivio_dropbox(db, persona="Papà"):
         salva(db)
     return aggiunti, gia_presenti
 
+@st.cache_data(ttl=300, show_spinner=False)
+def drive_leggi_anteprima(file_id):
+    """Scarica da Drive un singolo file scelto per mostrarne l'anteprima."""
+    from googleapiclient.http import MediaIoBaseDownload
+    service = drive_service()
+    info = service.files().get(
+        fileId=file_id,
+        fields="id,name,mimeType,size,webViewLink",
+    ).execute()
+    dimensione = int(info.get("size", 0) or 0)
+    if dimensione > 200 * 1024 * 1024:
+        raise RuntimeError("Il file supera 200 MB: aprilo direttamente su Google Drive.")
+    buffer = io.BytesIO()
+    downloader = MediaIoBaseDownload(buffer, service.files().get_media(fileId=file_id))
+    completato = False
+    while not completato:
+        _, completato = downloader.next_chunk()
+    return info, buffer.getvalue()
+
 def drive_scrivi_bytes(db, contenuto, nome, percorso, mimetype="application/json", sovrascrivi=True):
     from googleapiclient.http import MediaIoBaseUpload
     srv, parent = drive_service(), drive_root(db)
@@ -597,6 +616,33 @@ def archivio(db, tipo):
         persone = ["Tutti"] + sorted({str(r.get("persona", "Famiglia")) for r in righe})
         filtro_persona = st.selectbox("Filtra per persona", persone, key="persona_"+tipo)
     filtrate=[r for r in righe if (filtro_anno=="Tutti" or str(r.get("anno"))==filtro_anno) and (filtro_evento=="Tutti" or r.get("evento")==filtro_evento) and (filtro_persona=="Tutti" or str(r.get("persona", "Famiglia"))==filtro_persona)]
+    if media and filtrate:
+        st.subheader("👁️ Visualizza foto o filmato")
+        opzioni_anteprima = {
+            f"{r.get('persona', 'Famiglia')} · {r.get('nome_file', 'File')} · {r.get('evento', '')}": r
+            for r in filtrate if r.get("drive_id")
+        }
+        scelta_anteprima = st.selectbox(
+            "Scegli il file da visualizzare",
+            [""] + list(opzioni_anteprima),
+            key="anteprima_media",
+        )
+        if scelta_anteprima:
+            elemento = opzioni_anteprima[scelta_anteprima]
+            if elemento.get("link"):
+                st.link_button("↗️ Apri su Google Drive", elemento["link"], use_container_width=True)
+            try:
+                with st.spinner("Caricamento anteprima..."):
+                    info_file, contenuto_file = drive_leggi_anteprima(elemento["drive_id"])
+                mime = str(info_file.get("mimeType", ""))
+                if mime.startswith("image/") and mime not in {"image/heic", "image/heif"}:
+                    st.image(contenuto_file, caption=info_file.get("name", "Foto"), use_container_width=True)
+                elif mime.startswith("video/"):
+                    st.video(contenuto_file, format=mime)
+                else:
+                    st.info("Anteprima non disponibile per questo formato. Usa il pulsante Apri su Google Drive.")
+            except Exception as exc:
+                st.warning(f"Anteprima non disponibile: {exc}")
     colonne = ["anno","evento","descrizione","nome_file","link"]
     if media:
         colonne.insert(0, "persona")
