@@ -48,7 +48,7 @@ def nuovo_db():
         ("figlia17", "Figlia 17 anni", "figlio", "figlia17123"),
         ("figlia10", "Figlia 10 anni", "figlio", "figlia10123"),
     ]
-    db = {"versione": 2, "famiglia": "La nostra famiglia", "utenti": {}, "config": {"drive_folder_id": "", "budget_mensile": 0.0, "ultimo_backup_giornaliero": ""}}
+    db = {"versione": 2, "famiglia": "La nostra famiglia", "utenti": {}, "album_drive": {}, "config": {"drive_folder_id": "", "budget_mensile": 0.0, "ultimo_backup_giornaliero": ""}}
     for username, nome, ruolo, pwd in utenti:
         db["utenti"][username] = {"nome": nome, "ruolo": ruolo, "password": password_hash(pwd), "attivo": True}
     for c in COLLEZIONI: db[c] = []
@@ -71,6 +71,7 @@ def carica():
         st.session_state["drive_sync_error"] = str(exc)
     for c in COLLEZIONI: db.setdefault(c, [])
     db.setdefault("utenti", {})
+    db.setdefault("album_drive", {})
     db.setdefault("config", {})
     db["config"].setdefault("drive_folder_id", "")
     db["config"].setdefault("budget_mensile", 0.0)
@@ -363,6 +364,91 @@ def drive_carica_file_locale(db, percorso_file, nome_file, cartelle, mimetype="v
         fields="id,name,webViewLink",
     ).execute()
 
+def chiave_album_drive(categoria, luogo, titolo):
+    return "|".join([
+        str(categoria or "").strip().casefold(),
+        str(luogo or "").strip().casefold(),
+        str(titolo or "").strip().casefold(),
+    ])
+
+def drive_crea_collegamento(service, cartella_id, elemento, target_presenti=None):
+    """Aggiunge all'album un collegamento Drive senza duplicare il file originale."""
+    target_id = str(elemento.get("drive_id", ""))
+    if not target_id:
+        return False
+    if target_presenti is None:
+        presenti = service.files().list(
+            q=(
+                f"'{cartella_id}' in parents and trashed=false and "
+                "mimeType='application/vnd.google-apps.shortcut'"
+            ),
+            spaces="drive",
+            fields="files(id,shortcutDetails(targetId))",
+            pageSize=1000,
+        ).execute().get("files", [])
+        target_presenti = {
+            str(x.get("shortcutDetails", {}).get("targetId", "")) for x in presenti
+        }
+    if target_id in target_presenti:
+        return False
+    service.files().create(
+        body={
+            "name": str(elemento.get("nome_file", "Foto o filmato")),
+            "mimeType": "application/vnd.google-apps.shortcut",
+            "parents": [cartella_id],
+            "shortcutDetails": {"targetId": target_id},
+        },
+        fields="id",
+    ).execute()
+    target_presenti.add(target_id)
+    return True
+
+def drive_crea_o_aggiorna_album(db, categoria, luogo, titolo, elementi):
+    service, root = drive_service(), drive_root(db)
+    if not root:
+        raise RuntimeError("Manca [gcp_famiglia] folder_id nei Secrets.")
+    parent = root
+    for nome_cartella in ["ARCHIVIO", "ALBUM"]:
+        parent = drive_cartella(service, nome_cartella, parent)
+    nome_album = str(titolo or "Album").strip().replace("/", "-").replace("\\", "-")
+    cartella_album = drive_cartella(service, nome_album, parent)
+    collegamenti_presenti = service.files().list(
+        q=(
+            f"'{cartella_album}' in parents and trashed=false and "
+            "mimeType='application/vnd.google-apps.shortcut'"
+        ),
+        spaces="drive",
+        fields="files(shortcutDetails(targetId))",
+        pageSize=1000,
+    ).execute().get("files", [])
+    target_presenti = {
+        str(x.get("shortcutDetails", {}).get("targetId", "")) for x in collegamenti_presenti
+    }
+    aggiunti = 0
+    for elemento in elementi:
+        if drive_crea_collegamento(service, cartella_album, elemento, target_presenti):
+            aggiunti += 1
+    info = service.files().get(fileId=cartella_album, fields="id,name,webViewLink").execute()
+    chiave = chiave_album_drive(categoria, luogo, titolo)
+    db.setdefault("album_drive", {})[chiave] = {
+        "folder_id": cartella_album,
+        "link": info.get("webViewLink", ""),
+        "titolo": titolo,
+        "categoria": categoria,
+        "luogo": luogo,
+    }
+    salva(db)
+    return aggiunti, info
+
+def drive_aggiungi_ad_album_esistente(db, elemento):
+    chiave = chiave_album_drive(
+        elemento.get("categoria"), elemento.get("luogo"), elemento.get("titolo")
+    )
+    album = db.get("album_drive", {}).get(chiave)
+    if not album or not album.get("folder_id"):
+        return False
+    return drive_crea_collegamento(drive_service(), album["folder_id"], elemento)
+
 def genera_video_ricordo(db, elementi, titolo, durata_foto, musica, nome_ricordo, transizione):
     """Crea un MP4 16:9 usando foto e filmati già archiviati su Drive."""
     try:
@@ -653,6 +739,7 @@ def modulo_classificazione_multipla(db, righe):
                 elemento["parole_chiave"] = parole.strip()
                 elemento["evento"] = titolo_pulito
                 elemento["classificato_il"] = datetime.now().isoformat(timespec="seconds")
+                drive_aggiungi_ad_album_esistente(db, elemento)
                 completati += 1
             except Exception as exc:
                 errori.append(f"{nome_corrente}: {exc}")
@@ -664,7 +751,7 @@ def modulo_classificazione_multipla(db, righe):
         if completati and not errori:
             st.rerun()
 
-def modulo_album_eventi(righe):
+def modulo_album_eventi(db, righe):
     st.divider()
     st.subheader("📖 Album eventi")
     st.caption(
@@ -713,6 +800,31 @@ def modulo_album_eventi(righe):
     c1.metric("Contenuti", len(elementi))
     c2.metric("Fotografie", len(foto))
     c3.metric("Filmati", len(filmati))
+
+    chiave_drive = chiave_album_drive(dati["categoria"], dati["luogo"], dati["titolo"])
+    album_drive = db.get("album_drive", {}).get(chiave_drive, {})
+    testo_pulsante = "🔄 Aggiorna album su Google Drive" if album_drive else "☁️ Crea album su Google Drive"
+    if st.button(
+        testo_pulsante,
+        type="primary",
+        use_container_width=True,
+        key="crea_album_drive_" + hashlib.md5(chiave_drive.encode()).hexdigest()[:10],
+    ):
+        try:
+            with st.spinner("Creazione dell'album su Google Drive..."):
+                aggiunti, info_album = drive_crea_o_aggiorna_album(
+                    db, dati["categoria"], dati["luogo"], dati["titolo"], elementi
+                )
+            album_drive = db.get("album_drive", {}).get(chiave_drive, {})
+            st.success(f"Album Drive aggiornato: {aggiunti} nuovi collegamenti aggiunti.")
+        except Exception as exc:
+            st.error(f"Creazione album su Drive non riuscita: {exc}")
+    if album_drive.get("link"):
+        st.link_button(
+            "↗️ Apri album su Google Drive",
+            album_drive["link"],
+            use_container_width=True,
+        )
 
     carica_anteprime = st.checkbox(
         "Carica le anteprime fotografiche dell'album",
@@ -1166,6 +1278,7 @@ def archivio(db, tipo):
                         elemento["categoria"] = nuova_categoria
                         elemento["parole_chiave"] = nuove_parole.strip()
                         elemento["classificato_il"] = datetime.now().isoformat(timespec="seconds")
+                        drive_aggiungi_ad_album_esistente(db, elemento)
                         salva(db)
                         st.success("Foto o filmato classificato correttamente.")
                         st.rerun()
@@ -1176,7 +1289,7 @@ def archivio(db, tipo):
         colonne = ["persona", "categoria", "luogo", "titolo", "data_scatto"] + colonne
     tabella_con_elimina(db,tipo,filtrate,colonne)
     if media:
-        modulo_album_eventi(filtrate)
+        modulo_album_eventi(db, filtrate)
         modulo_crea_ricordo(db, filtrate)
 
 def semplice(db, raccolta, titolo, campi, condiviso_default):
