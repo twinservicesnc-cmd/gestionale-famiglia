@@ -1,5 +1,5 @@
 import streamlit as st
-import json, os, io, hashlib, secrets, uuid, tempfile, mimetypes
+import json, os, io, hashlib, secrets, uuid, tempfile, mimetypes, re
 from pathlib import Path
 from datetime import date, datetime
 
@@ -93,6 +93,15 @@ def oggi(): return date.today().isoformat()
 def nuovo_id(): return uuid.uuid4().hex
 def admin(): return st.session_state.get("ruolo") == "amministratore"
 def utente(): return st.session_state.get("username", "")
+
+def data_ora_da_nome_file(nome_file):
+    """Ricava data e ora dai nomi creati dal telefono."""
+    testo = Path(str(nome_file or "")).stem
+    trovato = re.search(r"(\d{4}-\d{2}-\d{2})[ _-]+(\d{2})[.:_-](\d{2})[.:_-](\d{2})", testo)
+    if trovato:
+        return f"{trovato.group(1)} {trovato.group(2)}:{trovato.group(3)}:{trovato.group(4)}"
+    trovato = re.search(r"(\d{4}-\d{2}-\d{2})", testo)
+    return trovato.group(1) if trovato else ""
 
 def visibili(righe):
     if admin(): return righe
@@ -281,6 +290,7 @@ def sincronizza_archivio_dropbox(db, persona="Papà"):
                 db.setdefault("media", []).append({
                     "anno": anno,
                     "evento": evento,
+                    "data_scatto": data_ora_da_nome_file(file_drive.get("name", "")),
                     "descrizione": f"Archivio automatico Dropbox · {persona}",
                     "nome_file": file_drive.get("name", ""),
                     "drive_id": drive_id,
@@ -618,6 +628,21 @@ def archivio(db, tipo):
             except Exception as exc:
                 st.error(f"Sincronizzazione archivio non riuscita: {exc}")
     righe=visibili(db[tipo])
+    if media:
+        dati_aggiornati = False
+        for riga_media in righe:
+            if not riga_media.get("data_scatto"):
+                data_rilevata = data_ora_da_nome_file(riga_media.get("nome_file", ""))
+                if data_rilevata:
+                    riga_media["data_scatto"] = data_rilevata
+                    dati_aggiornati = True
+            titolo_esistente = str(riga_media.get("titolo", "")).strip()
+            parole_esistenti = str(riga_media.get("parole_chiave", "")).strip()
+            if parole_esistenti and re.fullmatch(r"\d{4}-\d{2}-\d{2}[ .:_-]*\d{2}[ .:_-]*\d{2}[ .:_-]*\d{2}", titolo_esistente):
+                riga_media["titolo"] = parole_esistenti
+                dati_aggiornati = True
+        if dati_aggiornati:
+            salva(db)
     if not righe: st.info("Nessun file archiviato."); return
     anni=["Tutti"]+[str(x) for x in sorted({r.get("anno") for r in righe},reverse=True)]
     eventi=["Tutti"]+sorted({str(r.get("evento","")) for r in righe if r.get("evento")})
@@ -667,8 +692,13 @@ def archivio(db, tipo):
                 categorie.append(categoria_corrente)
             with st.form("classifica_" + str(elemento.get("id", elemento.get("drive_id", "file")))):
                 nuovo_titolo = st.text_input(
-                    "Titolo / nuovo nome",
+                    "Titolo (es. Napoli matrimonio Fabio)",
                     value=str(elemento.get("titolo", nome_base)),
+                )
+                st.text_input(
+                    "Data e ora della foto/filmato",
+                    value=str(elemento.get("data_scatto") or data_ora_da_nome_file(nome_corrente)),
+                    disabled=True,
                 )
                 nuova_categoria = st.selectbox(
                     "Categoria",
@@ -699,6 +729,7 @@ def archivio(db, tipo):
                             risultato_nome = drive_rinomina_file(elemento["drive_id"], nome_finale)
                             elemento["nome_file"] = risultato_nome.get("name", nome_finale)
                         elemento["titolo"] = titolo_pulito
+                        elemento["data_scatto"] = elemento.get("data_scatto") or data_ora_da_nome_file(nome_corrente)
                         elemento["categoria"] = nuova_categoria
                         elemento["parole_chiave"] = nuove_parole.strip()
                         elemento["classificato_il"] = datetime.now().isoformat(timespec="seconds")
@@ -709,7 +740,7 @@ def archivio(db, tipo):
                         st.error(f"Classificazione non riuscita: {exc}")
     colonne = ["anno","evento","descrizione","nome_file","link"]
     if media:
-        colonne = ["persona", "categoria", "titolo"] + colonne
+        colonne = ["persona", "data_scatto", "categoria", "titolo"] + colonne
     tabella_con_elimina(db,tipo,filtrate,colonne)
 
 def semplice(db, raccolta, titolo, campi, condiviso_default):
