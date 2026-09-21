@@ -363,12 +363,12 @@ def drive_carica_file_locale(db, percorso_file, nome_file, cartelle, mimetype="v
         fields="id,name,webViewLink",
     ).execute()
 
-def genera_video_ricordo(db, elementi, titolo, durata_foto, musica, nome_ricordo):
+def genera_video_ricordo(db, elementi, titolo, durata_foto, musica, nome_ricordo, transizione):
     """Crea un MP4 16:9 usando foto e filmati già archiviati su Drive."""
     try:
         from moviepy import (
             ImageClip, VideoFileClip, AudioFileClip, CompositeVideoClip,
-            concatenate_videoclips, concatenate_audioclips,
+            concatenate_videoclips, concatenate_audioclips, vfx,
         )
         from PIL import Image, ImageOps, ImageDraw, ImageFont
         import numpy as np
@@ -410,7 +410,17 @@ def genera_video_ricordo(db, elementi, titolo, durata_foto, musica, nome_ricordo
             drive_scarica_su_file(elemento["drive_id"], percorso)
             tipo = mimetypes.guess_type(nome)[0] or ""
             if tipo.startswith("image/"):
-                clip_finali.append(ImageClip(tela_da_immagine(percorso), duration=float(durata_foto)))
+                foto_clip = ImageClip(tela_da_immagine(percorso), duration=float(durata_foto))
+                if transizione == "Zoom lento + dissolvenza":
+                    zoom = foto_clip.resized(lambda t: 1 + 0.06 * (t / max(float(durata_foto), 1)))
+                    foto_animata = CompositeVideoClip(
+                        [zoom.with_position("center")],
+                        size=(larghezza, altezza), bg_color=(0, 0, 0),
+                    ).with_duration(float(durata_foto))
+                    clip_da_chiudere.extend([foto_clip, zoom, foto_animata])
+                    clip_finali.append(foto_animata)
+                else:
+                    clip_finali.append(foto_clip)
             elif tipo.startswith("video/"):
                 video = VideoFileClip(percorso)
                 clip_da_chiudere.append(video)
@@ -426,7 +436,18 @@ def genera_video_ricordo(db, elementi, titolo, durata_foto, musica, nome_ricordo
 
         if not clip_finali:
             raise RuntimeError("Nessuna foto o filmato compatibile selezionato.")
-        finale = concatenate_videoclips(clip_finali, method="compose")
+        durata_transizione = min(0.8, max(0.3, float(durata_foto) / 4))
+        clip_montati = [clip_finali[0]]
+        for clip in clip_finali[1:]:
+            if transizione in {"Dissolvenza", "Zoom lento + dissolvenza"}:
+                clip = clip.with_effects([vfx.CrossFadeIn(durata_transizione)])
+            elif transizione == "Scorrimento laterale":
+                clip = clip.with_effects([vfx.SlideIn(durata_transizione, "left")])
+            clip_montati.append(clip)
+        sovrapposizione = -durata_transizione if transizione != "Nessuna" else 0
+        finale = concatenate_videoclips(
+            clip_montati, method="compose", padding=sovrapposizione
+        )
         clip_da_chiudere.append(finale)
 
         if musica is not None:
@@ -496,6 +517,11 @@ def modulo_crea_ricordo(db, righe):
     titolo_video = c1.text_input("3. Titolo iniziale", placeholder="Il nostro ricordo")
     nome_video = c2.text_input("Nome del video", value="Ricordo di famiglia")
     durata_foto = st.slider("Durata di ogni fotografia", 2, 10, 4, help="Secondi")
+    transizione = st.selectbox(
+        "Animazione tra una foto e l'altra",
+        ["Dissolvenza", "Zoom lento + dissolvenza", "Scorrimento laterale", "Nessuna"],
+        help="La dissolvenza è la scelta più leggera ed elegante.",
+    )
     musica = st.file_uploader(
         "4. Musica personale (facoltativa)",
         type=["mp3", "m4a", "wav", "aac", "ogg"],
@@ -513,7 +539,7 @@ def modulo_crea_ricordo(db, righe):
             contenuti_ordinati = [x[2] for x in sorted(ordinati, key=lambda x: (x[0], x[1]))]
             with st.spinner("Creazione del video in corso: può richiedere alcuni minuti..."):
                 percorso_video, temp_dir = genera_video_ricordo(
-                    db, contenuti_ordinati, titolo_video, durata_foto, musica, nome_video
+                    db, contenuti_ordinati, titolo_video, durata_foto, musica, nome_video, transizione
                 )
                 video_bytes = Path(percorso_video).read_bytes()
                 risultato_drive = None
@@ -551,6 +577,169 @@ def modulo_crea_ricordo(db, righe):
         finally:
             if temp_dir:
                 shutil.rmtree(temp_dir, ignore_errors=True)
+
+def modulo_classificazione_multipla(db, righe):
+    st.subheader("🏷️ Classificazione multipla")
+    st.caption(
+        "Seleziona più foto o filmati dello stesso evento e assegna gli stessi dati in una sola volta."
+    )
+    opzioni = {}
+    for riga in righe:
+        if not riga.get("drive_id"):
+            continue
+        etichetta = " · ".join(filter(None, [
+            str(riga.get("persona", "Famiglia")),
+            str(riga.get("nome_file", "File")),
+            str(riga.get("data_scatto", "")),
+            str(riga.get("id", ""))[:5],
+        ]))
+        opzioni[etichetta] = riga
+    selezioni = st.multiselect(
+        "Foto e filmati da classificare insieme",
+        list(opzioni),
+        key="classificazione_multipla_elementi",
+    )
+    with st.form("form_classificazione_multipla"):
+        c1, c2 = st.columns(2)
+        luogo = c1.text_input("Luogo comune", placeholder="es. Napoli")
+        titolo = c2.text_input("Titolo dell'evento", placeholder="es. Matrimonio Fabio")
+        categoria = st.selectbox(
+            "Categoria comune",
+            ["Famiglia", "Vacanze", "Compleanni", "Feste", "Scuola", "Sport", "Viaggi", "Ricordi", "Altro"],
+        )
+        parole = st.text_input(
+            "Parole chiave comuni (separate da virgola)",
+            placeholder="es. matrimonio, famiglia, festa",
+        )
+        rinomina = st.checkbox(
+            "Rinomina anche tutti i file su Google Drive",
+            True,
+            help="Data, ora e codice finale rendono univoco ogni nome.",
+        )
+        conferma = st.form_submit_button(
+            f"Classifica {len(selezioni)} elementi",
+            type="primary",
+            use_container_width=True,
+            disabled=not selezioni,
+        )
+    if conferma:
+        titolo_pulito, luogo_pulito = titolo.strip(), luogo.strip()
+        if not titolo_pulito:
+            st.error("Inserisci il titolo dell'evento.")
+            return
+        completati, errori = 0, []
+        for etichetta in selezioni:
+            elemento = opzioni[etichetta]
+            nome_corrente = str(elemento.get("nome_file", "File"))
+            estensione = Path(nome_corrente).suffix
+            data_elemento = str(
+                elemento.get("data_scatto") or data_ora_da_nome_file(nome_corrente)
+            )
+            try:
+                if rinomina:
+                    data_nome = re.sub(r"[^0-9]", "", data_elemento) or "senza_data"
+                    codice = str(elemento.get("id") or elemento.get("drive_id", ""))[:5]
+                    parti_nome = [x for x in [luogo_pulito, titolo_pulito, data_nome, codice] if x]
+                    nome_finale = " - ".join(parti_nome) + estensione
+                    risultato = drive_rinomina_file(elemento["drive_id"], nome_finale)
+                    elemento["nome_file"] = risultato.get("name", nome_finale)
+                elemento["categoria"] = categoria
+                elemento["luogo"] = luogo_pulito
+                elemento["titolo"] = titolo_pulito
+                elemento["data_scatto"] = data_elemento
+                elemento["parole_chiave"] = parole.strip()
+                elemento["evento"] = titolo_pulito
+                elemento["classificato_il"] = datetime.now().isoformat(timespec="seconds")
+                completati += 1
+            except Exception as exc:
+                errori.append(f"{nome_corrente}: {exc}")
+        if completati:
+            salva(db)
+            st.success(f"Classificazione completata per {completati} elementi.")
+        if errori:
+            st.error("Non classificati: " + " | ".join(errori[:5]))
+        if completati and not errori:
+            st.rerun()
+
+def modulo_album_eventi(righe):
+    st.divider()
+    st.subheader("📖 Album eventi")
+    st.caption(
+        "Gli album si formano automaticamente raggruppando i contenuti con lo stesso "
+        "titolo, luogo e categoria. Non vengono create copie dei file."
+    )
+    album = {}
+    for riga in righe:
+        titolo = str(riga.get("titolo", "")).strip()
+        if not titolo or titolo.lower() in {"da classificare", "file"}:
+            continue
+        categoria = str(riga.get("categoria", "Da classificare")).strip()
+        luogo = str(riga.get("luogo", "")).strip()
+        chiave = (categoria.casefold(), luogo.casefold(), titolo.casefold())
+        album.setdefault(chiave, {
+            "categoria": categoria, "luogo": luogo, "titolo": titolo, "elementi": []
+        })["elementi"].append(riga)
+    if not album:
+        st.info("Classifica almeno una foto o un filmato per creare il primo album.")
+        return
+
+    opzioni = {}
+    for dati in album.values():
+        etichetta = " · ".join(filter(None, [
+            dati["titolo"], dati["luogo"], dati["categoria"],
+            f"{len(dati['elementi'])} contenuti",
+        ]))
+        opzioni[etichetta] = dati
+    album_scelto = st.selectbox(
+        "Scegli l'album da aprire",
+        list(opzioni),
+        key="album_evento_scelto",
+    )
+    dati = opzioni[album_scelto]
+    elementi = sorted(
+        dati["elementi"],
+        key=lambda x: str(x.get("data_scatto", "")),
+    )
+    st.markdown(f"### {dati['titolo']}")
+    dettagli = " · ".join(filter(None, [dati["categoria"], dati["luogo"]]))
+    if dettagli:
+        st.caption(dettagli)
+    foto = [x for x in elementi if (mimetypes.guess_type(str(x.get("nome_file", "")))[0] or "").startswith("image/")]
+    filmati = [x for x in elementi if (mimetypes.guess_type(str(x.get("nome_file", "")))[0] or "").startswith("video/")]
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Contenuti", len(elementi))
+    c2.metric("Fotografie", len(foto))
+    c3.metric("Filmati", len(filmati))
+
+    per_pagina = 12
+    pagine = max(1, math.ceil(len(elementi) / per_pagina))
+    pagina = st.selectbox(
+        "Pagina dell'album",
+        list(range(1, pagine + 1)),
+        key="pagina_album_evento",
+        disabled=pagine == 1,
+    )
+    inizio = (pagina - 1) * per_pagina
+    elementi_pagina = elementi[inizio:inizio + per_pagina]
+    colonne_album = st.columns(3)
+    for indice, elemento in enumerate(elementi_pagina):
+        with colonne_album[indice % 3]:
+            nome = str(elemento.get("nome_file", "File"))
+            tipo = mimetypes.guess_type(nome)[0] or ""
+            data_elemento = str(elemento.get("data_scatto", ""))
+            if tipo.startswith("image/") and Path(nome).suffix.lower() not in {".heic", ".heif"}:
+                try:
+                    _, contenuto = drive_leggi_anteprima(elemento["drive_id"])
+                    st.image(contenuto, use_container_width=True)
+                except Exception:
+                    st.info("🖼️ Anteprima non disponibile")
+            elif tipo.startswith("video/"):
+                st.info("🎬 Filmato")
+            else:
+                st.info("📎 Contenuto")
+            st.caption(data_elemento or nome)
+            if elemento.get("link"):
+                st.markdown(f"[Apri su Google Drive]({elemento['link']})")
 
 def drive_scrivi_bytes(db, contenuto, nome, percorso, mimetype="application/json", sovrascrivi=True):
     from googleapiclient.http import MediaIoBaseUpload
@@ -870,6 +1059,8 @@ def archivio(db, tipo):
         filtro_persona = st.selectbox("Filtra per persona", persone, key="persona_"+tipo)
     filtrate=[r for r in righe if (filtro_anno=="Tutti" or str(r.get("anno"))==filtro_anno) and (filtro_evento=="Tutti" or r.get("evento")==filtro_evento) and (filtro_persona=="Tutti" or str(r.get("persona", "Famiglia"))==filtro_persona)]
     if media and filtrate:
+        modulo_classificazione_multipla(db, filtrate)
+        st.divider()
         st.subheader("👁️ Visualizza foto o filmato")
         opzioni_anteprima = {
             " · ".join(filter(None, [
@@ -974,6 +1165,7 @@ def archivio(db, tipo):
         colonne = ["persona", "categoria", "luogo", "titolo", "data_scatto"] + colonne
     tabella_con_elimina(db,tipo,filtrate,colonne)
     if media:
+        modulo_album_eventi(filtrate)
         modulo_crea_ricordo(db, filtrate)
 
 def semplice(db, raccolta, titolo, campi, condiviso_default):
