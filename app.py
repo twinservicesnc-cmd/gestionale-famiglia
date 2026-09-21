@@ -197,6 +197,108 @@ def drive_file(service, nome, parent):
     files = service.files().list(q=q, fields="files(id,name,webViewLink,modifiedTime)", pageSize=1).execute().get("files", [])
     return files[0] if files else None
 
+def drive_figli(service, parent, solo_cartelle=False):
+    """Elenca tutti i figli non cestinati di una cartella Drive."""
+    query = f"'{parent}' in parents and trashed=false"
+    if solo_cartelle:
+        query += " and mimeType='application/vnd.google-apps.folder'"
+    risultati = []
+    page_token = None
+    while True:
+        risposta = service.files().list(
+            q=query,
+            spaces="drive",
+            fields=(
+                "nextPageToken,files("
+                "id,name,mimeType,size,webViewLink,createdTime,modifiedTime,appProperties)"
+            ),
+            pageSize=1000,
+            pageToken=page_token,
+        ).execute()
+        risultati.extend(risposta.get("files", []))
+        page_token = risposta.get("nextPageToken")
+        if not page_token:
+            return risultati
+
+def drive_trova_cartella(service, nome, parent):
+    nome_pulito = str(nome).replace("'", "")
+    query = (
+        f"name='{nome_pulito}' and "
+        "mimeType='application/vnd.google-apps.folder' and "
+        f"trashed=false and '{parent}' in parents"
+    )
+    trovate = service.files().list(
+        q=query,
+        spaces="drive",
+        fields="files(id,name)",
+        pageSize=1,
+    ).execute().get("files", [])
+    return trovate[0]["id"] if trovate else None
+
+def sincronizza_archivio_dropbox(db, persona="Papà"):
+    """Registra nel gestionale i file archiviati dal worker Dropbox."""
+    service = drive_service()
+    root = drive_root(db)
+    if not root:
+        raise RuntimeError("Manca [gcp_famiglia] folder_id nei Secrets.")
+
+    archivio_id = drive_trova_cartella(service, "ARCHIVIO", root)
+    if not archivio_id:
+        return 0, 0
+    persona_id = drive_trova_cartella(service, persona, archivio_id)
+    if not persona_id:
+        return 0, 0
+
+    drive_ids_presenti = {
+        str(r.get("drive_id", "")) for r in db.get("media", []) if r.get("drive_id")
+    }
+    aggiunti = gia_presenti = 0
+
+    for cartella_anno in drive_figli(service, persona_id, solo_cartelle=True):
+        anno_nome = str(cartella_anno.get("name", "")).strip()
+        anno = int(anno_nome) if anno_nome.isdigit() else anno_nome
+
+        for cartella_evento in drive_figli(
+            service, cartella_anno["id"], solo_cartelle=True
+        ):
+            evento = str(cartella_evento.get("name", "")).strip()
+            media_id = drive_trova_cartella(
+                service, "Foto e Video", cartella_evento["id"]
+            )
+            if not media_id:
+                continue
+
+            for file_drive in drive_figli(service, media_id):
+                if file_drive.get("mimeType") == "application/vnd.google-apps.folder":
+                    continue
+                drive_id = str(file_drive.get("id", ""))
+                if not drive_id:
+                    continue
+                if drive_id in drive_ids_presenti:
+                    gia_presenti += 1
+                    continue
+
+                db.setdefault("media", []).append({
+                    "anno": anno,
+                    "evento": evento,
+                    "descrizione": f"Archivio automatico Dropbox · {persona}",
+                    "nome_file": file_drive.get("name", ""),
+                    "drive_id": drive_id,
+                    "link": file_drive.get("webViewLink", ""),
+                    "origine": "Dropbox",
+                    "persona": persona,
+                    "id": nuovo_id(),
+                    "proprietario": utente(),
+                    "condiviso": True,
+                    "creato_il": datetime.now().isoformat(timespec="seconds"),
+                })
+                drive_ids_presenti.add(drive_id)
+                aggiunti += 1
+
+    if aggiunti:
+        salva(db)
+    return aggiunti, gia_presenti
+
 def drive_scrivi_bytes(db, contenuto, nome, percorso, mimetype="application/json", sovrascrivi=True):
     from googleapiclient.http import MediaIoBaseUpload
     srv, parent = drive_service(), drive_root(db)
@@ -455,13 +557,50 @@ def archivio(db, tipo):
                         st.session_state.pop("photos_session_id",None); st.session_state.pop("photos_picker_uri",None)
                         st.success(f"Importazione completata: {importati} file copiati su Drive"+(f", {saltati} già presenti." if saltati else "."))
                 except Exception as exc: st.error(str(exc))
+        st.divider()
+        st.subheader("☁️ Archivio automatico Dropbox")
+        st.caption(
+            "Aggiorna l'elenco con le foto e i filmati già copiati in "
+            "Google Drive dal collegamento Dropbox. I file non vengono duplicati."
+        )
+        scelta_dropbox = st.selectbox(
+            "Persona da sincronizzare",
+            ["Entrambi", "Papà", "Mamma"],
+            key="persona_sync_dropbox",
+        )
+        if st.button(
+            "Sincronizza archivio Dropbox da Google Drive",
+            use_container_width=True,
+        ):
+            try:
+                with st.spinner("Lettura dell'archivio Google Drive..."):
+                    persone = ["Papà", "Mamma"] if scelta_dropbox == "Entrambi" else [scelta_dropbox]
+                    aggiunti = gia_presenti = 0
+                    for persona_dropbox in persone:
+                        nuovi, presenti = sincronizza_archivio_dropbox(db, persona_dropbox)
+                        aggiunti += nuovi
+                        gia_presenti += presenti
+                st.success(
+                    f"Sincronizzazione completata: {aggiunti} nuovi file registrati, "
+                    f"{gia_presenti} già presenti."
+                )
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Sincronizzazione archivio non riuscita: {exc}")
     righe=visibili(db[tipo])
     if not righe: st.info("Nessun file archiviato."); return
     anni=["Tutti"]+[str(x) for x in sorted({r.get("anno") for r in righe},reverse=True)]
     eventi=["Tutti"]+sorted({str(r.get("evento","")) for r in righe if r.get("evento")})
     filtro_anno=st.selectbox("Filtra per anno",anni,key="anno_"+tipo); filtro_evento=st.selectbox("Filtra per evento",eventi,key="evento_"+tipo)
-    filtrate=[r for r in righe if (filtro_anno=="Tutti" or str(r.get("anno"))==filtro_anno) and (filtro_evento=="Tutti" or r.get("evento")==filtro_evento)]
-    tabella_con_elimina(db,tipo,filtrate,["anno","evento","descrizione","nome_file","link"])
+    filtro_persona = "Tutti"
+    if media:
+        persone = ["Tutti"] + sorted({str(r.get("persona", "Famiglia")) for r in righe})
+        filtro_persona = st.selectbox("Filtra per persona", persone, key="persona_"+tipo)
+    filtrate=[r for r in righe if (filtro_anno=="Tutti" or str(r.get("anno"))==filtro_anno) and (filtro_evento=="Tutti" or r.get("evento")==filtro_evento) and (filtro_persona=="Tutti" or str(r.get("persona", "Famiglia"))==filtro_persona)]
+    colonne = ["anno","evento","descrizione","nome_file","link"]
+    if media:
+        colonne.insert(0, "persona")
+    tabella_con_elimina(db,tipo,filtrate,colonne)
 
 def semplice(db, raccolta, titolo, campi, condiviso_default):
     st.title(titolo)
