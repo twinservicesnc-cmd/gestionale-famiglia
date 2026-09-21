@@ -691,8 +691,12 @@ def archivio(db, tipo):
             if categoria_corrente not in categorie:
                 categorie.append(categoria_corrente)
             with st.form("classifica_" + str(elemento.get("id", elemento.get("drive_id", "file")))):
+                nuovo_luogo = st.text_input(
+                    "Luogo (es. Napoli)",
+                    value=str(elemento.get("luogo", "")),
+                )
                 nuovo_titolo = st.text_input(
-                    "Titolo (es. Napoli matrimonio Fabio)",
+                    "Titolo (es. Matrimonio Fabio)",
                     value=str(elemento.get("titolo", nome_base)),
                 )
                 st.text_input(
@@ -722,13 +726,15 @@ def archivio(db, tipo):
                     st.error("Inserisci un titolo.")
                 else:
                     try:
-                        nome_finale = titolo_pulito
+                        luogo_pulito = nuovo_luogo.strip()
+                        nome_finale = f"{luogo_pulito} - {titolo_pulito}" if luogo_pulito else titolo_pulito
                         if estensione and not nome_finale.lower().endswith(estensione.lower()):
                             nome_finale += estensione
                         if rinomina_drive:
                             risultato_nome = drive_rinomina_file(elemento["drive_id"], nome_finale)
                             elemento["nome_file"] = risultato_nome.get("name", nome_finale)
                         elemento["titolo"] = titolo_pulito
+                        elemento["luogo"] = luogo_pulito
                         elemento["data_scatto"] = elemento.get("data_scatto") or data_ora_da_nome_file(nome_corrente)
                         elemento["categoria"] = nuova_categoria
                         elemento["parole_chiave"] = nuove_parole.strip()
@@ -740,7 +746,7 @@ def archivio(db, tipo):
                         st.error(f"Classificazione non riuscita: {exc}")
     colonne = ["anno","evento","descrizione","nome_file","link"]
     if media:
-        colonne = ["persona", "data_scatto", "categoria", "titolo"] + colonne
+        colonne = ["persona", "categoria", "luogo", "titolo", "data_scatto"] + colonne
     tabella_con_elimina(db,tipo,filtrate,colonne)
 
 def semplice(db, raccolta, titolo, campi, condiviso_default):
