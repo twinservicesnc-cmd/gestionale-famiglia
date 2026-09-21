@@ -1,5 +1,5 @@
 import streamlit as st
-import json, os, io, hashlib, secrets, uuid, tempfile, mimetypes, re
+import json, os, io, hashlib, secrets, uuid, tempfile, mimetypes, re, math, shutil
 from pathlib import Path
 from datetime import date, datetime
 
@@ -338,6 +338,219 @@ def drive_rinomina_file(file_id, nuovo_nome):
         body={"name": nome},
         fields="id,name,webViewLink",
     ).execute()
+
+def drive_scarica_su_file(file_id, destinazione):
+    from googleapiclient.http import MediaIoBaseDownload
+    richiesta = drive_service().files().get_media(fileId=file_id)
+    with open(destinazione, "wb") as uscita:
+        downloader = MediaIoBaseDownload(uscita, richiesta)
+        completato = False
+        while not completato:
+            _, completato = downloader.next_chunk()
+    return destinazione
+
+def drive_carica_file_locale(db, percorso_file, nome_file, cartelle, mimetype="video/mp4"):
+    from googleapiclient.http import MediaFileUpload
+    service, parent = drive_service(), drive_root(db)
+    if not parent:
+        raise RuntimeError("Manca [gcp_famiglia] folder_id nei Secrets.")
+    for cartella in cartelle:
+        parent = drive_cartella(service, cartella, parent)
+    media = MediaFileUpload(percorso_file, mimetype=mimetype, resumable=True)
+    return service.files().create(
+        body={"name": nome_file, "parents": [parent]},
+        media_body=media,
+        fields="id,name,webViewLink",
+    ).execute()
+
+def genera_video_ricordo(db, elementi, titolo, durata_foto, musica, nome_ricordo):
+    """Crea un MP4 16:9 usando foto e filmati già archiviati su Drive."""
+    try:
+        from moviepy import (
+            ImageClip, VideoFileClip, AudioFileClip, CompositeVideoClip,
+            concatenate_videoclips, concatenate_audioclips,
+        )
+        from PIL import Image, ImageOps, ImageDraw, ImageFont
+        import numpy as np
+    except Exception as exc:
+        raise RuntimeError(
+            "Mancano le librerie per creare il video. Aggiungi moviepy, pillow e imageio-ffmpeg a requirements.txt."
+        ) from exc
+
+    larghezza, altezza = 1280, 720
+    temp_dir = tempfile.mkdtemp(prefix="ricordo_")
+    clip_da_chiudere, clip_finali = [], []
+
+    def tela_da_immagine(percorso):
+        with Image.open(percorso) as originale:
+            foto = ImageOps.exif_transpose(originale).convert("RGB")
+            foto.thumbnail((larghezza, altezza), Image.Resampling.LANCZOS)
+            tela = Image.new("RGB", (larghezza, altezza), "black")
+            tela.paste(foto, ((larghezza-foto.width)//2, (altezza-foto.height)//2))
+            return np.array(tela)
+
+    try:
+        if titolo.strip():
+            tela = Image.new("RGB", (larghezza, altezza), (18, 25, 38))
+            draw = ImageDraw.Draw(tela)
+            font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+            try:
+                font = ImageFont.truetype(font_path, 58)
+            except Exception:
+                font = ImageFont.load_default()
+            testo = titolo.strip()
+            bbox = draw.textbbox((0, 0), testo, font=font)
+            draw.text(((larghezza-(bbox[2]-bbox[0]))/2, (altezza-(bbox[3]-bbox[1]))/2), testo, fill="white", font=font)
+            clip_finali.append(ImageClip(np.array(tela), duration=3))
+
+        for indice, elemento in enumerate(elementi):
+            nome = str(elemento.get("nome_file", f"file_{indice}"))
+            estensione = Path(nome).suffix or ".bin"
+            percorso = os.path.join(temp_dir, f"sorgente_{indice}{estensione}")
+            drive_scarica_su_file(elemento["drive_id"], percorso)
+            tipo = mimetypes.guess_type(nome)[0] or ""
+            if tipo.startswith("image/"):
+                clip_finali.append(ImageClip(tela_da_immagine(percorso), duration=float(durata_foto)))
+            elif tipo.startswith("video/"):
+                video = VideoFileClip(percorso)
+                clip_da_chiudere.append(video)
+                rapporto = min(larghezza/video.w, altezza/video.h)
+                ridimensionato = video.resized(rapporto)
+                composto = CompositeVideoClip(
+                    [ridimensionato.with_position("center")],
+                    size=(larghezza, altezza),
+                    bg_color=(0, 0, 0),
+                ).with_duration(video.duration)
+                clip_da_chiudere.extend([ridimensionato, composto])
+                clip_finali.append(composto)
+
+        if not clip_finali:
+            raise RuntimeError("Nessuna foto o filmato compatibile selezionato.")
+        finale = concatenate_videoclips(clip_finali, method="compose")
+        clip_da_chiudere.append(finale)
+
+        if musica is not None:
+            est_audio = Path(musica.name).suffix or ".mp3"
+            percorso_audio = os.path.join(temp_dir, "musica" + est_audio)
+            with open(percorso_audio, "wb") as uscita:
+                uscita.write(musica.getvalue())
+            audio = AudioFileClip(percorso_audio)
+            clip_da_chiudere.append(audio)
+            ripetizioni = max(1, math.ceil(finale.duration / audio.duration))
+            colonna_audio = concatenate_audioclips([audio] * ripetizioni).subclipped(0, finale.duration)
+            colonna_audio = colonna_audio.with_volume_scaled(0.35)
+            clip_da_chiudere.append(colonna_audio)
+            finale = finale.with_audio(colonna_audio)
+            clip_da_chiudere.append(finale)
+
+        nome_pulito = re.sub(r"[^A-Za-z0-9À-ÿ _-]+", "", nome_ricordo).strip() or "Ricordo"
+        percorso_finale = os.path.join(temp_dir, nome_pulito + ".mp4")
+        finale.write_videofile(
+            percorso_finale, codec="libx264", audio_codec="aac", fps=25,
+            preset="medium", threads=2, logger=None,
+        )
+        for clip in reversed(clip_da_chiudere + clip_finali):
+            try: clip.close()
+            except Exception: pass
+        return percorso_finale, temp_dir
+    except Exception:
+        for clip in reversed(clip_da_chiudere + clip_finali):
+            try: clip.close()
+            except Exception: pass
+        raise
+
+def modulo_crea_ricordo(db, righe):
+    st.divider()
+    st.subheader("🎬 Crea ricordo")
+    st.caption(
+        "Seleziona foto e filmati, stabilisci l'ordine e aggiungi una musica personale. "
+        "Il risultato sarà un video MP4."
+    )
+    disponibili = [r for r in righe if r.get("drive_id")]
+    etichette = {}
+    for r in disponibili:
+        etichetta = " · ".join(filter(None, [
+            str(r.get("persona", "Famiglia")), str(r.get("luogo", "")),
+            str(r.get("titolo", r.get("nome_file", "File"))),
+            str(r.get("data_scatto", "")), str(r.get("id", ""))[:5],
+        ]))
+        etichette[etichetta] = r
+    scelte = st.multiselect(
+        "1. Seleziona almeno due foto o filmati",
+        list(etichette),
+        key="ricordo_scelte",
+    )
+    selezionati = [etichette[x] for x in scelte]
+    ordinati = []
+    if selezionati:
+        st.markdown("**2. Imposta l’ordine**")
+        for posizione, elemento in enumerate(selezionati, 1):
+            c1, c2 = st.columns([1, 5])
+            ordine = c1.number_input(
+                "Ordine", min_value=1, max_value=len(selezionati), value=posizione,
+                key="ordine_ricordo_" + str(elemento.get("id", posizione)),
+            )
+            c2.write(elemento.get("titolo") or elemento.get("nome_file", "File"))
+            ordinati.append((ordine, posizione, elemento))
+    c1, c2 = st.columns(2)
+    titolo_video = c1.text_input("3. Titolo iniziale", placeholder="Il nostro ricordo")
+    nome_video = c2.text_input("Nome del video", value="Ricordo di famiglia")
+    durata_foto = st.slider("Durata di ogni fotografia", 2, 10, 4, help="Secondi")
+    musica = st.file_uploader(
+        "4. Musica personale (facoltativa)",
+        type=["mp3", "m4a", "wav", "aac", "ogg"],
+        key="musica_ricordo",
+    )
+    salva_drive = st.checkbox("Salva automaticamente il video in Google Drive", True)
+    if st.button(
+        "🎞️ Genera video MP4",
+        type="primary",
+        use_container_width=True,
+        disabled=len(selezionati) < 2,
+    ):
+        temp_dir = None
+        try:
+            contenuti_ordinati = [x[2] for x in sorted(ordinati, key=lambda x: (x[0], x[1]))]
+            with st.spinner("Creazione del video in corso: può richiedere alcuni minuti..."):
+                percorso_video, temp_dir = genera_video_ricordo(
+                    db, contenuti_ordinati, titolo_video, durata_foto, musica, nome_video
+                )
+                video_bytes = Path(percorso_video).read_bytes()
+                risultato_drive = None
+                if salva_drive:
+                    nome_mp4 = Path(percorso_video).name
+                    risultato_drive = drive_carica_file_locale(
+                        db, percorso_video, nome_mp4,
+                        ["ARCHIVIO", "RICORDI", str(date.today().year)],
+                    )
+                    registra(db, "media", {
+                        "anno": date.today().year,
+                        "evento": "Ricordi",
+                        "categoria": "Ricordi",
+                        "titolo": nome_video.strip() or "Ricordo di famiglia",
+                        "luogo": "",
+                        "data_scatto": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "descrizione": "Video ricordo creato dal gestionale",
+                        "nome_file": risultato_drive.get("name", nome_mp4),
+                        "drive_id": risultato_drive["id"],
+                        "link": risultato_drive.get("webViewLink", ""),
+                        "origine": "Crea ricordo",
+                        "persona": "Famiglia",
+                    }, True)
+            st.success("Video ricordo creato correttamente.")
+            st.video(video_bytes, format="video/mp4")
+            st.download_button(
+                "⬇️ Scarica video MP4", video_bytes,
+                file_name=Path(percorso_video).name, mime="video/mp4",
+                use_container_width=True,
+            )
+            if risultato_drive and risultato_drive.get("webViewLink"):
+                st.link_button("↗️ Apri il video su Google Drive", risultato_drive["webViewLink"], use_container_width=True)
+        except Exception as exc:
+            st.error(f"Creazione del video non riuscita: {exc}")
+        finally:
+            if temp_dir:
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
 def drive_scrivi_bytes(db, contenuto, nome, percorso, mimetype="application/json", sovrascrivi=True):
     from googleapiclient.http import MediaIoBaseUpload
@@ -760,6 +973,8 @@ def archivio(db, tipo):
     if media:
         colonne = ["persona", "categoria", "luogo", "titolo", "data_scatto"] + colonne
     tabella_con_elimina(db,tipo,filtrate,colonne)
+    if media:
+        modulo_crea_ricordo(db, filtrate)
 
 def semplice(db, raccolta, titolo, campi, condiviso_default):
     st.title(titolo)
