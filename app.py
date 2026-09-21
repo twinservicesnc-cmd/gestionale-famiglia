@@ -318,6 +318,17 @@ def drive_leggi_anteprima(file_id):
         _, completato = downloader.next_chunk()
     return info, buffer.getvalue()
 
+def drive_rinomina_file(file_id, nuovo_nome):
+    """Rinomina il file su Google Drive conservando il collegamento esistente."""
+    nome = str(nuovo_nome or "").strip().replace("/", "-").replace("\\", "-")
+    if not nome:
+        raise ValueError("Inserisci un nome valido.")
+    return drive_service().files().update(
+        fileId=file_id,
+        body={"name": nome},
+        fields="id,name,webViewLink",
+    ).execute()
+
 def drive_scrivi_bytes(db, contenuto, nome, percorso, mimetype="application/json", sovrascrivi=True):
     from googleapiclient.http import MediaIoBaseUpload
     srv, parent = drive_service(), drive_root(db)
@@ -643,9 +654,62 @@ def archivio(db, tipo):
                     st.info("Anteprima non disponibile per questo formato. Usa il pulsante Apri su Google Drive.")
             except Exception as exc:
                 st.warning(f"Anteprima non disponibile: {exc}")
+            st.subheader("🏷️ Classifica e rinomina")
+            nome_corrente = str(elemento.get("nome_file", "File"))
+            estensione = Path(nome_corrente).suffix
+            nome_base = Path(nome_corrente).stem
+            categorie = [
+                "Da classificare", "Famiglia", "Vacanze", "Compleanni",
+                "Feste", "Scuola", "Sport", "Viaggi", "Ricordi", "Altro",
+            ]
+            categoria_corrente = str(elemento.get("categoria", "Da classificare"))
+            if categoria_corrente not in categorie:
+                categorie.append(categoria_corrente)
+            with st.form("classifica_" + str(elemento.get("id", elemento.get("drive_id", "file")))):
+                nuovo_titolo = st.text_input(
+                    "Titolo / nuovo nome",
+                    value=str(elemento.get("titolo", nome_base)),
+                )
+                nuova_categoria = st.selectbox(
+                    "Categoria",
+                    categorie,
+                    index=categorie.index(categoria_corrente),
+                )
+                nuove_parole = st.text_input(
+                    "Parole chiave (separate da virgola)",
+                    value=str(elemento.get("parole_chiave", "")),
+                    placeholder="es. mare, estate, nonni",
+                )
+                rinomina_drive = st.checkbox("Rinomina anche il file su Google Drive", True)
+                salva_classificazione = st.form_submit_button(
+                    "Salva classificazione",
+                    type="primary",
+                    use_container_width=True,
+                )
+            if salva_classificazione:
+                titolo_pulito = nuovo_titolo.strip()
+                if not titolo_pulito:
+                    st.error("Inserisci un titolo.")
+                else:
+                    try:
+                        nome_finale = titolo_pulito
+                        if estensione and not nome_finale.lower().endswith(estensione.lower()):
+                            nome_finale += estensione
+                        if rinomina_drive:
+                            risultato_nome = drive_rinomina_file(elemento["drive_id"], nome_finale)
+                            elemento["nome_file"] = risultato_nome.get("name", nome_finale)
+                        elemento["titolo"] = titolo_pulito
+                        elemento["categoria"] = nuova_categoria
+                        elemento["parole_chiave"] = nuove_parole.strip()
+                        elemento["classificato_il"] = datetime.now().isoformat(timespec="seconds")
+                        salva(db)
+                        st.success("Foto o filmato classificato correttamente.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Classificazione non riuscita: {exc}")
     colonne = ["anno","evento","descrizione","nome_file","link"]
     if media:
-        colonne.insert(0, "persona")
+        colonne = ["persona", "categoria", "titolo"] + colonne
     tabella_con_elimina(db,tipo,filtrate,colonne)
 
 def semplice(db, raccolta, titolo, campi, condiviso_default):
