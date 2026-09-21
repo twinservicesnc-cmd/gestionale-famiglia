@@ -640,6 +640,10 @@ def archivio(db, tipo):
             parole_esistenti = str(riga_media.get("parole_chiave", "")).strip()
             if parole_esistenti and re.fullmatch(r"\d{4}-\d{2}-\d{2}[ .:_-]*\d{2}[ .:_-]*\d{2}[ .:_-]*\d{2}", titolo_esistente):
                 riga_media["titolo"] = parole_esistenti
+                titolo_esistente = parole_esistenti
+                dati_aggiornati = True
+            if "DA_CLASSIFICARE" in str(riga_media.get("evento", "")).upper() and titolo_esistente:
+                riga_media["evento"] = titolo_esistente
                 dati_aggiornati = True
         if dati_aggiornati:
             salva(db)
@@ -655,7 +659,13 @@ def archivio(db, tipo):
     if media and filtrate:
         st.subheader("👁️ Visualizza foto o filmato")
         opzioni_anteprima = {
-            f"{r.get('persona', 'Famiglia')} · {r.get('nome_file', 'File')} · {r.get('evento', '')}": r
+            " · ".join(filter(None, [
+                str(r.get("persona", "Famiglia")),
+                str(r.get("categoria", "Da classificare")),
+                str(r.get("luogo", "")),
+                str(r.get("titolo", r.get("nome_file", "File"))),
+                str(r.get("data_scatto", "")),
+            ])): r
             for r in filtrate if r.get("drive_id")
         }
         scelta_anteprima = st.selectbox(
@@ -735,6 +745,8 @@ def archivio(db, tipo):
                             elemento["nome_file"] = risultato_nome.get("name", nome_finale)
                         elemento["titolo"] = titolo_pulito
                         elemento["luogo"] = luogo_pulito
+                        if "DA_CLASSIFICARE" in str(elemento.get("evento", "")).upper():
+                            elemento["evento"] = titolo_pulito
                         elemento["data_scatto"] = elemento.get("data_scatto") or data_ora_da_nome_file(nome_corrente)
                         elemento["categoria"] = nuova_categoria
                         elemento["parole_chiave"] = nuove_parole.strip()
