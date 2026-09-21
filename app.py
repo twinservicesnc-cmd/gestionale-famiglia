@@ -377,7 +377,8 @@ def genera_video_ricordo(db, elementi, titolo, durata_foto, musica, nome_ricordo
             "Mancano le librerie per creare il video. Aggiungi moviepy, pillow e imageio-ffmpeg a requirements.txt."
         ) from exc
 
-    larghezza, altezza = 1280, 720
+    # Formato HD leggero, adatto ai limiti CPU di Streamlit Cloud.
+    larghezza, altezza = 854, 480
     temp_dir = tempfile.mkdtemp(prefix="ricordo_")
     clip_da_chiudere, clip_finali = [], []
 
@@ -467,8 +468,8 @@ def genera_video_ricordo(db, elementi, titolo, durata_foto, musica, nome_ricordo
         nome_pulito = re.sub(r"[^A-Za-z0-9À-ÿ _-]+", "", nome_ricordo).strip() or "Ricordo"
         percorso_finale = os.path.join(temp_dir, nome_pulito + ".mp4")
         finale.write_videofile(
-            percorso_finale, codec="libx264", audio_codec="aac", fps=25,
-            preset="medium", threads=2, logger=None,
+            percorso_finale, codec="libx264", audio_codec="aac", fps=20,
+            preset="ultrafast", threads=1, logger=None,
         )
         for clip in reversed(clip_da_chiudere + clip_finali):
             try: clip.close()
@@ -502,6 +503,8 @@ def modulo_crea_ricordo(db, righe):
         key="ricordo_scelte",
     )
     selezionati = [etichette[x] for x in scelte]
+    if len(selezionati) > 20:
+        st.warning("Per non superare i limiti di Streamlit Cloud, seleziona al massimo 20 contenuti per video.")
     ordinati = []
     if selezionati:
         st.markdown("**2. Imposta l’ordine**")
@@ -532,7 +535,7 @@ def modulo_crea_ricordo(db, righe):
         "🎞️ Genera video MP4",
         type="primary",
         use_container_width=True,
-        disabled=len(selezionati) < 2,
+        disabled=len(selezionati) < 2 or len(selezionati) > 20,
     ):
         temp_dir = None
         try:
@@ -711,7 +714,13 @@ def modulo_album_eventi(righe):
     c2.metric("Fotografie", len(foto))
     c3.metric("Filmati", len(filmati))
 
-    per_pagina = 12
+    carica_anteprime = st.checkbox(
+        "Carica le anteprime fotografiche dell'album",
+        False,
+        help="Lascialo disattivato quando vuoi soltanto consultare l'elenco: riduce l'uso della CPU.",
+        key="carica_anteprime_album",
+    )
+    per_pagina = 6
     pagine = max(1, math.ceil(len(elementi) / per_pagina))
     pagina = st.selectbox(
         "Pagina dell'album",
@@ -727,12 +736,14 @@ def modulo_album_eventi(righe):
             nome = str(elemento.get("nome_file", "File"))
             tipo = mimetypes.guess_type(nome)[0] or ""
             data_elemento = str(elemento.get("data_scatto", ""))
-            if tipo.startswith("image/") and Path(nome).suffix.lower() not in {".heic", ".heif"}:
+            if carica_anteprime and tipo.startswith("image/") and Path(nome).suffix.lower() not in {".heic", ".heif"}:
                 try:
                     _, contenuto = drive_leggi_anteprima(elemento["drive_id"])
                     st.image(contenuto, use_container_width=True)
                 except Exception:
                     st.info("🖼️ Anteprima non disponibile")
+            elif tipo.startswith("image/"):
+                st.info("🖼️ Fotografia")
             elif tipo.startswith("video/"):
                 st.info("🎬 Filmato")
             else:
