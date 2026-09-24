@@ -801,6 +801,80 @@ def modulo_album_eventi(db, righe):
     c2.metric("Fotografie", len(foto))
     c3.metric("Filmati", len(filmati))
 
+    st.markdown("#### 📕 Sfoglia il fotolibro")
+    st.caption(
+        "Le pagine vengono composte automaticamente con 2, 3 o 4 foto e filmati, "
+        "in ordine di data. Viene caricata soltanto la pagina che stai guardando."
+    )
+    chiave_libro = hashlib.md5(
+        chiave_album_drive(dati["categoria"], dati["luogo"], dati["titolo"]).encode()
+    ).hexdigest()[:10]
+    pagine_libro = []
+    indice_elemento = 0
+    schema_pagine = (2, 3, 4)
+    while indice_elemento < len(elementi):
+        quanti = schema_pagine[len(pagine_libro) % len(schema_pagine)]
+        pagine_libro.append(elementi[indice_elemento:indice_elemento + quanti])
+        indice_elemento += quanti
+
+    stato_pagina = f"fotolibro_pagina_{chiave_libro}"
+    pagina_corrente = int(st.session_state.get(stato_pagina, 0))
+    pagina_corrente = max(0, min(pagina_corrente, len(pagine_libro) - 1))
+    st.session_state[stato_pagina] = pagina_corrente
+
+    nav1, nav2, nav3, nav4, nav5 = st.columns([1, 1, 2, 1, 1])
+    if nav1.button("⏮️", key=f"libro_prima_{chiave_libro}", disabled=pagina_corrente == 0, help="Prima pagina"):
+        st.session_state[stato_pagina] = 0
+        st.rerun()
+    if nav2.button("◀️", key=f"libro_indietro_{chiave_libro}", disabled=pagina_corrente == 0, help="Pagina precedente"):
+        st.session_state[stato_pagina] = pagina_corrente - 1
+        st.rerun()
+    nav3.markdown(
+        f"<div style='text-align:center;padding:.45rem;font-weight:700'>"
+        f"Pagina {pagina_corrente + 1} di {len(pagine_libro)}</div>",
+        unsafe_allow_html=True,
+    )
+    if nav4.button("▶️", key=f"libro_avanti_{chiave_libro}", disabled=pagina_corrente >= len(pagine_libro) - 1, help="Pagina successiva"):
+        st.session_state[stato_pagina] = pagina_corrente + 1
+        st.rerun()
+    if nav5.button("⏭️", key=f"libro_ultima_{chiave_libro}", disabled=pagina_corrente >= len(pagine_libro) - 1, help="Ultima pagina"):
+        st.session_state[stato_pagina] = len(pagine_libro) - 1
+        st.rerun()
+
+    st.markdown(
+        "<div style='height:8px;border-radius:8px 8px 0 0;"
+        "background:linear-gradient(90deg,#7b4b2a,#d7b47a,#7b4b2a);'></div>",
+        unsafe_allow_html=True,
+    )
+    elementi_libro = pagine_libro[pagina_corrente]
+    colonne_libro = st.columns(2 if len(elementi_libro) == 2 else min(len(elementi_libro), 4))
+    for posizione, elemento in enumerate(elementi_libro):
+        with colonne_libro[posizione % len(colonne_libro)]:
+            nome = str(elemento.get("nome_file", "Contenuto"))
+            tipo = mimetypes.guess_type(nome)[0] or ""
+            estensione = Path(nome).suffix.lower()
+            data_elemento = str(elemento.get("data_scatto", "")).strip()
+            if tipo.startswith("image/") and estensione not in {".heic", ".heif"}:
+                try:
+                    _, contenuto = drive_leggi_anteprima(elemento["drive_id"])
+                    st.image(contenuto, use_container_width=True)
+                except Exception:
+                    st.info("🖼️ Anteprima non disponibile")
+            elif tipo.startswith("video/"):
+                st.info("🎬 Filmato — premi sotto per visualizzarlo")
+            else:
+                st.info("🖼️ Fotografia — aprila su Google Drive")
+            st.markdown(f"**{data_elemento or nome}**")
+            if elemento.get("descrizione"):
+                st.caption(str(elemento.get("descrizione")))
+            if elemento.get("link"):
+                st.link_button("Apri", elemento["link"], use_container_width=True)
+    st.markdown(
+        "<div style='height:8px;border-radius:0 0 8px 8px;"
+        "background:linear-gradient(90deg,#7b4b2a,#d7b47a,#7b4b2a);margin-bottom:1rem'></div>",
+        unsafe_allow_html=True,
+    )
+
     chiave_drive = chiave_album_drive(dati["categoria"], dati["luogo"], dati["titolo"])
     album_drive = db.get("album_drive", {}).get(chiave_drive, {})
     testo_pulsante = "🔄 Aggiorna album su Google Drive" if album_drive else "☁️ Crea album su Google Drive"
