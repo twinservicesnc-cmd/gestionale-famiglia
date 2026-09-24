@@ -329,6 +329,29 @@ def drive_leggi_anteprima(file_id):
         _, completato = downloader.next_chunk()
     return info, buffer.getvalue()
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def immagine_visualizzabile(nome_file, contenuto):
+    """Converte HEIC/HEIF in una piccola anteprima JPEG senza modificare l'originale."""
+    estensione = Path(str(nome_file or "")).suffix.lower()
+    if estensione not in {".heic", ".heif"}:
+        return contenuto
+    try:
+        from pillow_heif import register_heif_opener
+        from PIL import Image, ImageOps
+        register_heif_opener()
+        with Image.open(io.BytesIO(contenuto)) as foto:
+            foto = ImageOps.exif_transpose(foto)
+            foto.thumbnail((1600, 1600))
+            if foto.mode not in {"RGB", "L"}:
+                foto = foto.convert("RGB")
+            uscita = io.BytesIO()
+            foto.save(uscita, format="JPEG", quality=84, optimize=True)
+            return uscita.getvalue()
+    except ImportError as exc:
+        raise RuntimeError(
+            "Per visualizzare le foto HEIC aggiungi pillow-heif al requirements.txt."
+        ) from exc
+
 def drive_rinomina_file(file_id, nuovo_nome):
     """Rinomina il file su Google Drive conservando il collegamento esistente."""
     nome = str(nuovo_nome or "").strip().replace("/", "-").replace("\\", "-")
@@ -448,6 +471,113 @@ def drive_aggiungi_ad_album_esistente(db, elemento):
     if not album or not album.get("folder_id"):
         return False
     return drive_crea_collegamento(drive_service(), album["folder_id"], elemento)
+
+def crea_e_salva_fotolibro_pdf(db, dati_album, pagine):
+    """Genera il fotolibro in PDF e lo salva su Drive senza duplicare gli originali."""
+    try:
+        from reportlab.pdfgen import canvas
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib.utils import ImageReader
+    except ImportError as exc:
+        raise RuntimeError("Aggiungi reportlab al requirements.txt per creare il fotolibro PDF.") from exc
+
+    larghezza, altezza = landscape(A4)
+    margine, spazio = 32, 16
+    memoria = io.BytesIO()
+    pdf = canvas.Canvas(memoria, pagesize=(larghezza, altezza))
+    titolo = str(dati_album.get("titolo", "Fotolibro")).strip() or "Fotolibro"
+    sottotitolo = " · ".join(filter(None, [
+        str(dati_album.get("luogo", "")).strip(),
+        str(dati_album.get("categoria", "")).strip(),
+    ]))
+
+    # Copertina
+    pdf.setFillColorRGB(0.96, 0.93, 0.86)
+    pdf.rect(0, 0, larghezza, altezza, fill=1, stroke=0)
+    pdf.setFillColorRGB(0.25, 0.13, 0.07)
+    pdf.setFont("Helvetica-Bold", 32)
+    pdf.drawCentredString(larghezza / 2, altezza / 2 + 25, titolo[:55])
+    if sottotitolo:
+        pdf.setFont("Helvetica", 16)
+        pdf.drawCentredString(larghezza / 2, altezza / 2 - 15, sottotitolo[:80])
+    pdf.setFont("Helvetica-Oblique", 11)
+    pdf.drawCentredString(larghezza / 2, 42, "Fotolibro della famiglia")
+    pdf.showPage()
+
+    def riquadri_pagina(numero):
+        area_w, area_h = larghezza - 2 * margine, altezza - 2 * margine - 22
+        if numero == 1:
+            return [(margine, margine + 22, area_w, area_h)]
+        if numero == 2:
+            w = (area_w - spazio) / 2
+            return [(margine, margine + 22, w, area_h), (margine + w + spazio, margine + 22, w, area_h)]
+        if numero == 3:
+            w = (area_w - spazio) / 2
+            h = (area_h - spazio) / 2
+            return [(margine, margine + 22, w, area_h), (margine + w + spazio, margine + 22 + h + spazio, w, h), (margine + w + spazio, margine + 22, w, h)]
+        w = (area_w - spazio) / 2
+        h = (area_h - spazio) / 2
+        return [(margine, margine + 22 + h + spazio, w, h), (margine + w + spazio, margine + 22 + h + spazio, w, h), (margine, margine + 22, w, h), (margine + w + spazio, margine + 22, w, h)]
+
+    for numero_pagina, elementi_pagina in enumerate(pagine, start=1):
+        pdf.setFillColorRGB(1, 1, 1)
+        pdf.rect(0, 0, larghezza, altezza, fill=1, stroke=0)
+        for elemento, (x, y, w, h) in zip(elementi_pagina, riquadri_pagina(len(elementi_pagina))):
+            nome = str(elemento.get("nome_file", "Contenuto"))
+            estensione = Path(nome).suffix.lower()
+            tipo = mimetypes.guess_type(nome)[0] or ""
+            didascalia = str(elemento.get("data_scatto", "")).strip() or nome
+            pdf.setFillColorRGB(0.94, 0.94, 0.94)
+            pdf.roundRect(x, y, w, h, 5, fill=1, stroke=0)
+            if tipo.startswith("image/") or estensione in {".heic", ".heif"}:
+                try:
+                    _, originale = drive_leggi_anteprima(elemento["drive_id"])
+                    visualizzabile = immagine_visualizzabile(nome, originale)
+                    from PIL import Image
+                    with Image.open(io.BytesIO(visualizzabile)) as img:
+                        iw, ih = img.size
+                    max_w, max_h = w - 10, h - 30
+                    scala = min(max_w / iw, max_h / ih)
+                    dw, dh = iw * scala, ih * scala
+                    pdf.drawImage(
+                        ImageReader(io.BytesIO(visualizzabile)),
+                        x + (w - dw) / 2, y + 24 + (max_h - dh) / 2,
+                        width=dw, height=dh, preserveAspectRatio=True, mask="auto",
+                    )
+                except Exception:
+                    pdf.setFillColorRGB(0.35, 0.35, 0.35)
+                    pdf.setFont("Helvetica", 12)
+                    pdf.drawCentredString(x + w / 2, y + h / 2, "Anteprima non disponibile")
+            else:
+                pdf.setFillColorRGB(0.25, 0.25, 0.25)
+                pdf.setFont("Helvetica-Bold", 18)
+                pdf.drawCentredString(x + w / 2, y + h / 2, "FILMATO")
+                if elemento.get("link"):
+                    pdf.linkURL(str(elemento["link"]), (x, y, x + w, y + h), relative=0)
+            pdf.setFillColorRGB(0.15, 0.15, 0.15)
+            pdf.setFont("Helvetica", 8)
+            pdf.drawCentredString(x + w / 2, y + 8, didascalia[:80])
+        pdf.setFillColorRGB(0.35, 0.35, 0.35)
+        pdf.setFont("Helvetica", 8)
+        pdf.drawRightString(larghezza - margine, 12, f"Pagina {numero_pagina}")
+        pdf.showPage()
+    pdf.save()
+
+    nome_sicuro = re.sub(r"[^A-Za-z0-9À-ÿ _-]+", "", titolo).strip().replace(" ", "_")
+    nome_pdf = f"Fotolibro_{nome_sicuro or 'Album'}.pdf"
+    risultato = drive_scrivi_bytes(
+        db, memoria.getvalue(), nome_pdf, ["ARCHIVIO", "FOTOLIBRI"],
+        mimetype="application/pdf", sovrascrivi=True,
+    )
+    chiave = chiave_album_drive(dati_album.get("categoria"), dati_album.get("luogo"), titolo)
+    db.setdefault("fotolibri_drive", {})[chiave] = {
+        "file_id": risultato.get("id", ""),
+        "link": risultato.get("webViewLink", ""),
+        "nome": risultato.get("name", nome_pdf),
+        "aggiornato_il": datetime.now().isoformat(timespec="seconds"),
+    }
+    salva(db)
+    return risultato
 
 def genera_video_ricordo(db, elementi, titolo, durata_foto, musica, nome_ricordo, transizione):
     """Crea un MP4 16:9 usando foto e filmati già archiviati su Drive."""
@@ -854,10 +984,13 @@ def modulo_album_eventi(db, righe):
             tipo = mimetypes.guess_type(nome)[0] or ""
             estensione = Path(nome).suffix.lower()
             data_elemento = str(elemento.get("data_scatto", "")).strip()
-            if tipo.startswith("image/") and estensione not in {".heic", ".heif"}:
+            if tipo.startswith("image/") or estensione in {".heic", ".heif"}:
                 try:
                     _, contenuto = drive_leggi_anteprima(elemento["drive_id"])
-                    st.image(contenuto, use_container_width=True)
+                    st.image(
+                        immagine_visualizzabile(nome, contenuto),
+                        use_container_width=True,
+                    )
                 except Exception:
                     st.info("🖼️ Anteprima non disponibile")
             elif tipo.startswith("video/"):
@@ -874,6 +1007,27 @@ def modulo_album_eventi(db, righe):
         "background:linear-gradient(90deg,#7b4b2a,#d7b47a,#7b4b2a);margin-bottom:1rem'></div>",
         unsafe_allow_html=True,
     )
+
+    chiave_fotolibro = chiave_album_drive(dati["categoria"], dati["luogo"], dati["titolo"])
+    if st.button(
+        "📘 Crea e salva fotolibro PDF su Google Drive",
+        type="primary",
+        use_container_width=True,
+        key=f"salva_fotolibro_{chiave_libro}",
+    ):
+        try:
+            with st.spinner("Creazione e salvataggio del fotolibro in corso..."):
+                crea_e_salva_fotolibro_pdf(db, dati, pagine_libro)
+            st.success("Fotolibro PDF creato e salvato su Google Drive.")
+        except Exception as exc:
+            st.error(f"Creazione del fotolibro non riuscita: {exc}")
+    fotolibro_drive = db.get("fotolibri_drive", {}).get(chiave_fotolibro, {})
+    if fotolibro_drive.get("link"):
+        st.link_button(
+            "↗️ Apri il fotolibro PDF su Google Drive",
+            fotolibro_drive["link"],
+            use_container_width=True,
+        )
 
     chiave_drive = chiave_album_drive(dati["categoria"], dati["luogo"], dati["titolo"])
     album_drive = db.get("album_drive", {}).get(chiave_drive, {})
@@ -922,10 +1076,13 @@ def modulo_album_eventi(db, righe):
             nome = str(elemento.get("nome_file", "File"))
             tipo = mimetypes.guess_type(nome)[0] or ""
             data_elemento = str(elemento.get("data_scatto", ""))
-            if carica_anteprime and tipo.startswith("image/") and Path(nome).suffix.lower() not in {".heic", ".heif"}:
+            if carica_anteprime and (tipo.startswith("image/") or Path(nome).suffix.lower() in {".heic", ".heif"}):
                 try:
                     _, contenuto = drive_leggi_anteprima(elemento["drive_id"])
-                    st.image(contenuto, use_container_width=True)
+                    st.image(
+                        immagine_visualizzabile(nome, contenuto),
+                        use_container_width=True,
+                    )
                 except Exception:
                     st.info("🖼️ Anteprima non disponibile")
             elif tipo.startswith("image/"):
@@ -1282,8 +1439,13 @@ def archivio(db, tipo):
                 with st.spinner("Caricamento anteprima..."):
                     info_file, contenuto_file = drive_leggi_anteprima(elemento["drive_id"])
                 mime = str(info_file.get("mimeType", ""))
-                if mime.startswith("image/") and mime not in {"image/heic", "image/heif"}:
-                    st.image(contenuto_file, caption=info_file.get("name", "Foto"), use_container_width=True)
+                nome_anteprima = str(info_file.get("name", elemento.get("nome_file", "Foto")))
+                if mime.startswith("image/") or Path(nome_anteprima).suffix.lower() in {".heic", ".heif"}:
+                    st.image(
+                        immagine_visualizzabile(nome_anteprima, contenuto_file),
+                        caption=nome_anteprima,
+                        use_container_width=True,
+                    )
                 elif mime.startswith("video/"):
                     st.video(contenuto_file, format=mime)
                 else:
