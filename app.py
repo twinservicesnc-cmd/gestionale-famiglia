@@ -1144,6 +1144,35 @@ def drive_upload(db, file, percorso):
     out = srv.files().create(body=meta, media_body=media, fields="id,webViewLink,name").execute()
     return out
 
+def drive_upload_named(db, file, nome_file, percorso):
+    """Carica un file con un nome catalogato, lasciando invariato l'originale sul dispositivo."""
+    from googleapiclient.http import MediaIoBaseUpload
+    srv, parent = drive_service(), drive_root(db)
+    if not parent:
+        raise RuntimeError("Manca [gcp_famiglia] folder_id nei Secrets.")
+    for nome_cartella in percorso:
+        parent = drive_cartella(srv, str(nome_cartella), parent)
+    media = MediaIoBaseUpload(
+        io.BytesIO(file.getvalue()),
+        mimetype=file.type or "application/octet-stream",
+        resumable=True,
+    )
+    return srv.files().create(
+        body={"name": nome_file, "parents": [parent]},
+        media_body=media,
+        fields="id,webViewLink,name",
+    ).execute()
+
+def nome_documento_catalogato(persona, categoria, tipo_documento, data_documento, nome_originale, indice=0):
+    estensione = Path(str(nome_originale or "")).suffix.lower()
+    parti = [persona, categoria, tipo_documento, str(data_documento)]
+    base = " - ".join(str(x).strip() for x in parti if str(x).strip())
+    base = re.sub(r'[\\/:*?"<>|]+', "-", base)
+    base = re.sub(r"\s+", " ", base).strip(" .-") or "Documento"
+    if indice:
+        base += f" - {indice}"
+    return base + estensione
+
 def drive_upload_path(db, percorso_file, nome_file, mimetype, percorso):
     from googleapiclient.http import MediaFileUpload
     srv, parent = drive_service(), drive_root(db)
@@ -1317,19 +1346,77 @@ def scadenze(db):
 
 def archivio(db, tipo):
     media = tipo=="media"; st.title("📷 Foto e filmati" if media else "📁 Documenti importanti")
-    anno=st.selectbox("Anno",list(range(date.today().year+1,1999,-1))); evento=st.text_input("Evento / categoria"); descrizione=st.text_input("Descrizione")
+    if media:
+        anno=st.selectbox("Anno",list(range(date.today().year+1,1999,-1)))
+        evento=st.text_input("Evento / categoria")
+        descrizione=st.text_input("Descrizione")
+        persona_documento = categoria_documento = tipo_documento = ""
+        data_documento = date.today()
+    else:
+        st.caption(
+            "Cataloga ogni documento indicando nome, categoria, tipo e data. "
+            "Il file viene rinominato e archiviato automaticamente nella cartella corretta di Google Drive."
+        )
+        nomi_famiglia = sorted({
+            str(info.get("nome", "")).strip()
+            for info in db.get("utenti", {}).values() if str(info.get("nome", "")).strip()
+        })
+        persone_documenti = ["Famiglia"] + [x for x in nomi_famiglia if x != "Famiglia"]
+        categorie_documenti = [
+            "Salute", "Documenti personali", "Scuola", "Lavoro", "Fiscale",
+            "Assicurazioni", "Casa", "Veicoli", "Contratti", "Altro",
+        ]
+        c1, c2 = st.columns(2)
+        categoria_documento = c1.selectbox("Categoria", categorie_documenti, key="doc_categoria_upload")
+        persona_documento = c2.selectbox("Nome / intestatario", persone_documenti, key="doc_persona_upload")
+        c3, c4 = st.columns([2, 1])
+        tipo_documento = c3.text_input(
+            "Tipo di documento",
+            placeholder="es. Esame del sangue, Carta d'identità, Contratto",
+            key="doc_tipo_upload",
+        )
+        data_documento = c4.date_input("Data del documento", value=date.today(), key="doc_data_upload")
+        descrizione = st.text_input(
+            "Descrizione / note (facoltative)",
+            placeholder="es. controllo annuale, scadenza, medico o ente",
+            key="doc_descrizione_upload",
+        )
+        anno = data_documento.year
+        evento = categoria_documento
     if media:
         st.subheader("📱 Carica dal telefono, tablet o computer")
     files=st.file_uploader("Seleziona file",accept_multiple_files=True,type=None if media else ["pdf","doc","docx","jpg","jpeg","png","xlsx"])
     condiviso=st.checkbox("Visibile alla famiglia",True)
-    if st.button("Carica su Google Drive",type="primary",disabled=not files or not evento):
+    pronto_upload = bool(files and evento and (media or tipo_documento.strip()))
+    if st.button("Carica su Google Drive",type="primary",disabled=not pronto_upload):
         ok=0
-        for f in files:
+        for indice_file, f in enumerate(files, start=1):
             try:
-                out=drive_upload(db,f,["ARCHIVIO",str(anno),evento,"Foto e Video" if media else "Documenti"])
-                registra(db,tipo,{"anno":anno,"evento":evento,"descrizione":descrizione,"nome_file":out["name"],"drive_id":out["id"],"link":out.get("webViewLink","")},condiviso); ok+=1
+                if media:
+                    out=drive_upload(db,f,["ARCHIVIO",str(anno),evento,"Foto e Video"])
+                    dati_file={"anno":anno,"evento":evento,"descrizione":descrizione,"nome_file":out["name"],"drive_id":out["id"],"link":out.get("webViewLink","")}
+                else:
+                    nome_finale = nome_documento_catalogato(
+                        persona_documento, categoria_documento, tipo_documento,
+                        data_documento, f.name, indice_file if len(files) > 1 else 0,
+                    )
+                    out=drive_upload_named(
+                        db, f, nome_finale,
+                        ["ARCHIVIO", "Documenti", persona_documento, categoria_documento, str(anno)],
+                    )
+                    dati_file={
+                        "anno":anno, "evento":categoria_documento, "categoria":categoria_documento,
+                        "persona":persona_documento, "nome":persona_documento,
+                        "tipo_documento":tipo_documento.strip(), "titolo":tipo_documento.strip(),
+                        "data_documento":str(data_documento), "descrizione":descrizione,
+                        "nome_originale":f.name, "nome_file":out["name"],
+                        "drive_id":out["id"], "link":out.get("webViewLink","")
+                    }
+                registra(db,tipo,dati_file,condiviso); ok+=1
             except Exception as e: st.error(str(e)); break
-        if ok: st.success(f"Caricati {ok} file su Google Drive.")
+        if ok:
+            st.success(f"Caricati e catalogati {ok} file su Google Drive.")
+            st.rerun()
     if media:
         st.divider(); st.subheader("🖼️ Importa da Google Foto")
         st.caption("Seleziona anche molte foto e filmati insieme; il gestionale li copierà automaticamente nell'evento indicato sopra.")
@@ -1406,10 +1493,14 @@ def archivio(db, tipo):
     if not righe: st.info("Nessun file archiviato."); return
     anni=["Tutti"]+[str(x) for x in sorted({r.get("anno") for r in righe},reverse=True)]
     eventi=["Tutti"]+sorted({str(r.get("evento","")) for r in righe if r.get("evento")})
-    filtro_anno=st.selectbox("Filtra per anno",anni,key="anno_"+tipo); filtro_evento=st.selectbox("Filtra per evento",eventi,key="evento_"+tipo)
+    filtro_anno=st.selectbox("Filtra per anno",anni,key="anno_"+tipo)
+    filtro_evento=st.selectbox("Filtra per evento" if media else "Filtra per categoria",eventi,key="evento_"+tipo)
     filtro_persona = "Tutti"
     if media:
         persone = ["Tutti"] + sorted({str(r.get("persona", "Famiglia")) for r in righe})
+        filtro_persona = st.selectbox("Filtra per persona", persone, key="persona_"+tipo)
+    else:
+        persone = ["Tutti"] + sorted({str(r.get("persona", "Non assegnato")) for r in righe})
         filtro_persona = st.selectbox("Filtra per persona", persone, key="persona_"+tipo)
     filtrate=[r for r in righe if (filtro_anno=="Tutti" or str(r.get("anno"))==filtro_anno) and (filtro_evento=="Tutti" or r.get("evento")==filtro_evento) and (filtro_persona=="Tutti" or str(r.get("persona", "Famiglia"))==filtro_persona)]
     if media and filtrate:
@@ -1523,6 +1614,8 @@ def archivio(db, tipo):
     colonne = ["anno","evento","descrizione","nome_file","link"]
     if media:
         colonne = ["persona", "categoria", "luogo", "titolo", "data_scatto"] + colonne
+    else:
+        colonne = ["categoria", "nome", "data_documento", "tipo_documento", "descrizione", "nome_file", "link"]
     tabella_con_elimina(db,tipo,filtrate,colonne)
     if media:
         modulo_album_eventi(db, filtrate)
